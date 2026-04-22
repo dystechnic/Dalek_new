@@ -9,8 +9,8 @@ Consolidates previous version with four separate Arduinos into one ESP32:
   - dalek_motors.ino (Nano)      -> stepper motors
 
 Architecture:
-  Core 0 (motorTask)  - stepper run loop + sensor polling
-  Core 1 (Arduino)    - WiFi server + LED + sound (setup/loop)
+  - Core 0 (motorTask)  - stepper run loop + sensor polling
+  - Core 1 (Arduino)    - WiFi server + LED + sound (setup/loop)
 
 Optimisations vs first version:
   1. FastAccelStepper  - uses ESP32 RMT hardware peripheral for
