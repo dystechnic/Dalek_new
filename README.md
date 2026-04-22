@@ -1,6 +1,6 @@
 # Dalek-V2.0
 
- =============================================================
+=============================================================
   main.cpp  -  Dalek ESP32 unified firmware
 
   Consolidates previous version with four separate Arduinos into one ESP32:
@@ -27,4 +27,4 @@
     4. WiFi credentials in secrets.ini  - never in source code.
     5. Motor direction invert flags  - configurable in config.h
        without rewiring.
- =============================================================
+=============================================================
