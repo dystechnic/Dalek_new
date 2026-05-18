@@ -8,7 +8,7 @@ None.
 
 Good day.
 
-Consolidates the original four-Arduino design (ESP-01, Mega, Pro Mini, Nano) into a single ESP32-WROOM-32U on a DevKitC V4 board.
+Dalek_new consolidates the [original](https://github.com/dystechnic/NSD-Dalek) four-Arduino design (ESP-01, Mega, Pro Mini, Nano) into a single ESP32-WROOM-32U on a DevKitC V4 board.
 
 ## Hardware
 
