@@ -6,8 +6,14 @@
 //  WiFi credentials live in secrets.ini (never commit that file).
 // =============================================================
 
-// -- Debug output (comment out to disable) ---------------------
+// =============================================================
+//  DEBUG
+//  Comment out the #define to disable all serial output.
+//  When disabled: no Serial.begin(), zero runtime overhead,
+//  and the serial monitor will show nothing.
+// =============================================================
 #define DEBUG
+
 #ifdef DEBUG
   #define DBG(x)   Serial.print(x)
   #define DBGLN(x) Serial.println(x)
@@ -17,13 +23,20 @@
 #endif
 
 // =============================================================
-//  PIN ASSIGNMENTS  (ESP32 DevKit v1 - 30 or 38 pin)
-//  Avoid: 6-11 (flash), 34-39 are input-only (no pull-up/drive)
+//  PIN ASSIGNMENTS  (ESP32 DevKitC V4 - WROOM-32U, 38 pin)
+//
+//  AVOID:
+//    6-11   internal flash - never use
+//    34-39  input-only (no pull-up/drive) - read only
+//    0,2,12,15  strapping pins - avoid driving at boot
 // =============================================================
 
 // -- Ultrasonic sensors (Maxbotix EZ1, PWM output) ------------
+//    GPIO 32 is a safe unrestricted output pin.
 //    Pins 34-36 are input-only - fine for pulseIn reads.
-#define PIN_SONIC_TRIGGER   15   // common trigger -> all three sensors RX
+//    Add 10k pull-down resistors on pins 34/35/36 in hardware
+//    to prevent floating inputs when sensors are disconnected.
+#define PIN_SONIC_TRIGGER   32   // common trigger -> all three sensors RX
 #define PIN_SONIC_RIGHT     34   // PWM output of right sensor
 #define PIN_SONIC_CENTER    35   // PWM output of center sensor
 #define PIN_SONIC_LEFT      36   // PWM output of left sensor
@@ -76,7 +89,7 @@
 #define DEFAULT_VOLUME      30          // 0-30
 #define BORED_INTERVAL_MS   900000UL    // 15 minutes
 #define PULSE_INTERVAL_MS    10000UL    // eyestalk pulse period
-#define BOOT_DELAY_MS        15000UL    // startup animation duration
+#define BOOT_DELAY_MS        3000UL     // startup animation (increase to 15000 for final build)
 
 // Sound folder / track numbers (match your SD card layout)
 #define SND_FOLDER          10

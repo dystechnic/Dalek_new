@@ -1,10 +1,42 @@
+// =============================================================
+//  main.cpp  -  Dalek ESP32 unified firmware
+//
+//  Consolidates four separate Arduinos into one ESP32:
+//    - dalek_WiFi.ino   (ESP-01)    -> WiFiServer + web UI
+//    - dalek_main.ino   (Mega)      -> Ultrasonic sensors
+//    - dalek_dome.ino   (Pro Mini)  -> FastLED + DFPlayer
+//    - dalek_motors.ino (Nano)      -> stepper motors
+//
+//  Architecture:
+//    Core 0 (motorTask)  - stepper run loop + sensor polling
+//    Core 1 (Arduino)    - WiFi server + LED + sound (setup/loop)
+//
+//  Optimisations vs first version:
+//    1. FastAccelStepper  - uses ESP32 RMT hardware peripheral for
+//       step pulses; stepper timing is interrupt-driven and never
+//       misses a step regardless of what else is running.
+//    2. Non-blocking dome events  - doStayAway / doExterminate /
+//       doBored use millis() state machines instead of delay(),
+//       so the web server stays responsive during sound/light events.
+//    3. Sensor reads moved to a short sub-task window  - pulseIn
+//       calls are still sequential (hardware constraint of the
+//       daisy-chain) but happen in a timed 500 ms slot so the
+//       stepper task loop is free the rest of the time.
+//    4. WiFi credentials in secrets.ini  - never in source code.
+//    5. Motor direction invert flags  - configurable in config.h
+//       without rewiring.
+// =============================================================
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <LittleFS.h>
 #include <FastLED.h>
 #include <FastAccelStepper.h>
 #include <DFRobotDFPlayerMini.h>
 #include "config.h"
+#include "esp_task_wdt.h"
+#include "esp_system.h"    // esp_reset_reason()
 
 // WiFi credentials injected via secrets.ini build flags
 #ifndef WIFI_SSID
@@ -222,8 +254,10 @@ void motorTask(void* pvParameters) {
         }
 
         // FastAccelStepper handles pulses via RMT interrupt - no run() needed.
-        // Yield to keep watchdog happy without a fixed 1 ms penalty.
-        taskYIELD();
+        // vTaskDelay(1) gives the IDLE task on Core 0 a guaranteed turn each
+        // iteration, which resets the task watchdog and prevents the WDT crash.
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -258,6 +292,10 @@ static int        paletteRound = 0;
 bool updateDomeFSM() {
     unsigned long now = millis();
 
+    // Rate-limit fade steps to ~60/sec so loop() stays free for the web server
+    static unsigned long lastFadeStep = 0;
+    bool fadeReady = (now - lastFadeStep >= 16);
+
     switch (domeState) {
 
         case DOME_IDLE:
@@ -265,6 +303,8 @@ bool updateDomeFSM() {
 
         // ---- fade up (used for stay-away / exterminate / stalkBlue) ----
         case DOME_FADE_UP:
+            if (!fadeReady) return true;
+            lastFadeStep = now;
             fadeBrightness += 3;
             if (fadeBrightness >= 255) { fadeBrightness = 255; domeState = DOME_HOLD; domeStateStart = now; }
             FastLED.setBrightness(fadeBrightness);
@@ -278,6 +318,8 @@ bool updateDomeFSM() {
 
         // ---- fade down then go idle ----
         case DOME_FADE_DOWN:
+            if (!fadeReady) return true;
+            lastFadeStep = now;
             fadeBrightness -= 3;
             if (fadeBrightness <= 0) {
                 fadeBrightness = 0;
@@ -292,6 +334,8 @@ bool updateDomeFSM() {
 
         // ---- eyestalk pulse (dim then bright) ----
         case DOME_PULSE_DOWN:
+            if (!fadeReady) return true;
+            lastFadeStep = now;
             fadeBrightness -= 3;
             if (fadeBrightness <= 20) { fadeBrightness = 20; domeState = DOME_PULSE_UP; }
             FastLED.setBrightness(fadeBrightness);
@@ -299,6 +343,8 @@ bool updateDomeFSM() {
             return true;
 
         case DOME_PULSE_UP:
+            if (!fadeReady) return true;
+            lastFadeStep = now;
             fadeBrightness += 3;
             if (fadeBrightness >= 255) {
                 fadeBrightness = 255;
@@ -463,121 +509,161 @@ void processDomeCmd(int& prevCmd, int& boredCount,
 //  WEB SERVER  (Core 1)
 // =============================================================
 
-static String sDisplayMode   = "aan";
-static String sMovementState = "uit";
-static String sSoundState    = "aan";
+static bool sDisplayMode   = true;
+static bool sMotorRunning  = false;
+static bool sSoundEnabled  = true;
 
-const char HTML_HEADER[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html>
-<head>
-  <title>Dalek control station</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="10">
-  <link rel="icon" href="data:,">
-  <style>
-    html { background-color:#B0C4DE; font-family:Helvetica;
-           display:inline-block; margin:0 auto; text-align:center; }
-    .button { background-color:#ff2d00; border:none; border-radius:12px;
-              color:white; width:150px; padding:10px;
-              font-size:30px; margin:2px; cursor:pointer; }
-    .button2 { background-color:#08b203; }
-    .round  { height:40px; width:55px; background-color:#eae0c2;
-              font-size:30px; margin:2px; cursor:pointer;
-              border-radius:12%; border:none; }
-    .p1 { font-size:x-large; color:black; }
-  </style>
-</head>
-<body>
-<h1>!! Exterminate !!</h1>
-)rawliteral";
+// JSON status endpoint - polled every 3s by the page via fetch()
+void handleStatus() {
+    String rssi   = String(WiFi.RSSI());
+    String uptime = String(millis() / 1000);
+    String json =
+        "{\"display\":"  + String(sDisplayMode  ? "true" : "false") +
+        ",\"motors\":"   + String(sMotorRunning  ? "true" : "false") +
+        ",\"sound\":"    + String(sSoundEnabled  ? "true" : "false") +
+        ",\"volume\":"   + String(volume) +
+        ",\"right\":"    + String(rightCM)  +
+        ",\"center\":"   + String(centerCM) +
+        ",\"left\":"     + String(leftCM)   +
+        ",\"rssi\":"     + rssi +
+        ",\"uptime\":"   + uptime +
+        "}";
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", json);
+}
+
+// HTML is served from LittleFS (data/index.html).
+// Flash the filesystem with: pio run --target uploadfs
 
 void handleRoot() {
-    String html = FPSTR(HTML_HEADER);
-
-    html += "<p><b>DisplayMode = " + sDisplayMode + "</b></p>";
-    if (sDisplayMode == "uit")
-        html += "<p><a href='/display/on'><button class='button'>display</button></a></p>";
-    else
-        html += "<p><a href='/display/off'><button class='button button2'>display</button></a></p>";
-
-    html += "<p><b>Motoren = " + sMovementState + "</b></p>";
-    if (sMovementState == "uit")
-        html += "<p><a href='/movement/on'><button class='button'>motoren</button></a></p>";
-    else
-        html += "<p><a href='/movement/off'><button class='button button2'>motoren</button></a></p>";
-
-    html += "<p><b>Geluid = " + sSoundState + "</b></p>";
-    if (sSoundState == "uit")
-        html += "<p><a href='/sound/on'><button class='button'>geluid</button></a></p>";
-    else
-        html += "<p><a href='/sound/off'><button class='button button2'>geluid</button></a></p>";
-
-    html += "<p><b>Volume</b></p>";
-    html += "<p class='p1'><a href='/volume/up'><button class='round'>+</button></a>";
-    html += "&nbsp;" + String(volume) + "&nbsp;";
-    html += "<a href='/volume/down'><button class='round'>-</button></a></p>";
-
-    html += "<hr><p><small>R:" + String(rightCM) + "cm &nbsp; C:" + String(centerCM)
-          + "cm &nbsp; L:" + String(leftCM) + "cm</small></p>";
-
-    html += "</body></html>";
-    server.send(200, "text/html", html);
+    if (LittleFS.exists("/index.html")) {
+        File f = LittleFS.open("/index.html", "r");
+        server.streamFile(f, "text/html");
+        f.close();
+    } else {
+        server.send(503, "text/plain",
+            "Filesystem not found. Run: pio run --target uploadfs");
+    }
 }
+
 
 void setupWebRoutes() {
     server.on("/", handleRoot);
+    server.on("/status", handleStatus);
 
-    server.on("/display/on", [](){
-        sDisplayMode = "aan"; sMovementState = "uit"; sSoundState = "aan";
-        soundEnabled = true;  motorRunning = false;
-        setMotorCmd(2); setDomeCmd(15);
-        server.sendHeader("Location", "/"); server.send(303);
-    });
-    server.on("/display/off", [](){
-        sDisplayMode = "uit"; sMovementState = "uit"; sSoundState = "uit";
-        soundEnabled = false; motorRunning = false;
-        setMotorCmd(2); setDomeCmd(14);
-        server.sendHeader("Location", "/"); server.send(303);
-    });
-    server.on("/movement/on", [](){
-        if (sDisplayMode == "uit") {
-            sMovementState = "aan";
-            motorRunning = true;
-            setDomeCmd(19);
+    server.on("/display/toggle", [](){
+        if (sDisplayMode) {
+            sDisplayMode = false; sMotorRunning = false; sSoundEnabled = false;
+            soundEnabled = false; motorRunning  = false;
+            setMotorCmd(2); setDomeCmd(14);
+        } else {
+            sDisplayMode = true; sSoundEnabled = true;
+            soundEnabled = true;
+            setDomeCmd(15);
         }
-        server.sendHeader("Location", "/"); server.send(303);
+        server.send(200, "text/plain", "ok");
     });
-    server.on("/movement/off", [](){
-        sMovementState = "uit"; motorRunning = false;
-        setMotorCmd(2); setDomeCmd(18);
-        server.sendHeader("Location", "/"); server.send(303);
+    server.on("/movement/toggle", [](){
+        if (!sDisplayMode) {   // motors only allowed when display is off
+            sMotorRunning = !sMotorRunning;
+            motorRunning  =  sMotorRunning;
+            if (sMotorRunning) setDomeCmd(19); else { setMotorCmd(2); setDomeCmd(18); }
+        }
+        server.send(200, "text/plain", "ok");
     });
-    server.on("/sound/on",  [](){ sSoundState = "aan"; setDomeCmd(15); server.sendHeader("Location", "/"); server.send(303); });
-    server.on("/sound/off", [](){ sSoundState = "uit"; setDomeCmd(14); server.sendHeader("Location", "/"); server.send(303); });
-    server.on("/volume/up",   [](){ setDomeCmd(16); server.sendHeader("Location", "/"); server.send(303); });
-    server.on("/volume/down", [](){ setDomeCmd(17); server.sendHeader("Location", "/"); server.send(303); });
+    server.on("/sound/toggle", [](){
+        sSoundEnabled = !sSoundEnabled;
+        soundEnabled  =  sSoundEnabled;
+        setDomeCmd(sSoundEnabled ? 15 : 14);
+        server.send(200, "text/plain", "ok");
+    });
+    server.on("/volume/up",   [](){ setDomeCmd(16); server.send(200, "text/plain", "ok"); });
+    server.on("/volume/down", [](){ setDomeCmd(17); server.send(200, "text/plain", "ok"); });
 }
 
 // =============================================================
 //  SETUP  (Core 1)
 // =============================================================
 void setup() {
+    #ifdef DEBUG
     Serial.begin(115200);
+    #endif
     DBGLN("\n\n--- Dalek ESP32 booting ---");
+
+    // ---- Print last reset reason (helps diagnose unexpected reboots) ----
+    DBG("Reset reason  : ");
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   DBGLN("Power on");           break;
+        case ESP_RST_SW:        DBGLN("Software reset");     break;
+        case ESP_RST_PANIC:     DBGLN("*** PANIC/CRASH ***"); break;
+        case ESP_RST_INT_WDT:   DBGLN("*** INT WATCHDOG ***");break;
+        case ESP_RST_TASK_WDT:  DBGLN("*** TASK WATCHDOG ***");break;
+        case ESP_RST_WDT:       DBGLN("*** WATCHDOG ***");   break;
+        case ESP_RST_BROWNOUT:  DBGLN("*** BROWNOUT ***");   break;
+        case ESP_RST_SDIO:      DBGLN("SDIO reset");         break;
+        default:                DBGLN("Unknown");            break;
+    }
+
+    // ---- LittleFS ----
+    if (LittleFS.begin(true)) {   // true = format if mount fails
+        DBGLN("LittleFS      : OK");
+    } else {
+        DBGLN("LittleFS      : FAILED");
+    }
 
     // FastLED
     FastLED.addLeds<LED_CHIPSET, PIN_LED_DATA, LED_COLOR_ORDER>(leds, NUM_LEDS)
            .setCorrection(Typical8mmPixel);
     FastLED.clear(true);
 
-    // DFPlayer on hardware Serial2
-    Serial2.begin(9600, SERIAL_8N1, PIN_DFPLAYER_RX, PIN_DFPLAYER_TX);
-    int retries = 10;
-    while (!mp3.begin(Serial2) && retries-- > 0) {
-        DBGLN("DFPlayer not ready, retrying...");
-        delay(500);
+    // ---- WiFi first - before slow inits so output is visible immediately ----
+    DBGLN("----------------------------------------");
+    DBG("WiFi SSID     : "); DBGLN(WIFI_SSID);
+    DBGLN("Connecting...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    int wifiRetries = 40;   // 20 seconds total
+    while (WiFi.status() != WL_CONNECTED && wifiRetries-- > 0) {
+        delay(500); DBG(".");
     }
-    mp3.volume(DEFAULT_VOLUME);
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+        DBGLN("WiFi status   : CONNECTED");
+        DBG("IP address    : "); DBGLN(WiFi.localIP());
+        DBG("Gateway       : "); DBGLN(WiFi.gatewayIP());
+        DBG("Signal (RSSI) : "); DBG(WiFi.RSSI()); DBGLN(" dBm");
+        DBG("Channel       : "); DBGLN(WiFi.channel());
+        DBG("MAC address   : "); DBGLN(WiFi.macAddress());
+    } else {
+        DBGLN("WiFi status   : FAILED - running offline");
+        DBG("Status code   : ");
+        switch (WiFi.status()) {
+            case WL_NO_SSID_AVAIL:  DBGLN("WL_NO_SSID_AVAIL (SSID not found)"); break;
+            case WL_CONNECT_FAILED: DBGLN("WL_CONNECT_FAILED (wrong password?)"); break;
+            case WL_DISCONNECTED:   DBGLN("WL_DISCONNECTED (timed out)"); break;
+            default: DBGLN(WiFi.status()); break;
+        }
+    }
+    DBGLN("----------------------------------------");
+
+    // ---- DFPlayer on hardware Serial2 (non-fatal if absent) ----
+    bool dfplayerOK = false;
+    Serial2.begin(9600, SERIAL_8N1, PIN_DFPLAYER_RX, PIN_DFPLAYER_TX);
+    int retries = 5;
+    while (!dfplayerOK && retries-- > 0) {
+        if (mp3.begin(Serial2)) {
+            dfplayerOK = true;
+        } else {
+            DBGLN("DFPlayer not ready, retrying...");
+            delay(500);
+        }
+    }
+    if (dfplayerOK) {
+        mp3.volume(DEFAULT_VOLUME);
+        DBGLN("DFPlayer      : OK");
+    } else {
+        DBGLN("DFPlayer      : NOT FOUND - sound disabled");
+        soundEnabled = false;
+    }
 
     // Sonic sensor pins
     pinMode(PIN_SONIC_TRIGGER, OUTPUT);
@@ -593,22 +679,7 @@ void setup() {
     // Spin in the boot animation until it finishes
     while (updateDomeFSM()) { /* yields via loop in FSM */ }
     DBGLN("Boot complete");
-    mp3.volume(DEFAULT_VOLUME);
     playSound(SND_MOAN);
-
-    // WiFi
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    DBG("Connecting to WiFi");
-    int wifiRetries = 30;
-    while (WiFi.status() != WL_CONNECTED && wifiRetries-- > 0) {
-        delay(500); DBG(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        DBGLN("\nWiFi connected. IP:");
-        DBGLN(WiFi.localIP());
-    } else {
-        DBGLN("\nWiFi FAILED - running offline");
-    }
 
     setupWebRoutes();
     server.begin();
@@ -635,11 +706,22 @@ void setup() {
 // =============================================================
 void loop() {
     server.handleClient();
+    esp_task_wdt_reset();   // keep Core 1 watchdog happy
 
-    static int          prevDomeCmd = -1;
-    static int          boredCount  = 0;
-    static unsigned long lastBored  = millis();
-    static unsigned long lastPulse  = millis();
+    static int           prevDomeCmd = -1;
+    static int           boredCount  = 0;
+    static unsigned long lastBored   = millis();
+    static unsigned long lastPulse   = millis();
+    static unsigned long lastHB      = millis();
+
+    // Heartbeat every 30s - confirms loop() is still running
+    if (millis() - lastHB >= 30000UL) {
+        lastHB = millis();
+        DBG("[HB] uptime="); DBG(millis()/1000);
+        DBG("s  heap=");     DBG(ESP.getFreeHeap());
+        DBG("  wifi=");      DBGLN(WiFi.status() == WL_CONNECTED ? "OK" : "DOWN");
+        if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+    }
 
     processDomeCmd(prevDomeCmd, boredCount, lastBored, lastPulse);
 

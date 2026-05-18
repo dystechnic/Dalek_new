@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DALEK // COMMAND INTERFACE</title>
+<link rel="icon" href="data:,">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --red:#ff2200;--amber:#ffaa00;--green:#00ff88;
+  --dim:#003322;--bg:#050a07;--panel:#0a1410;
+  --border:#1a3a28;--text:#c8ffe8;--muted:#557766;
+  --font-d:'Orbitron',monospace;--font-m:'Share Tech Mono',monospace;
+}
+html,body{background:var(--bg);color:var(--text);font-family:var(--font-m);font-size:14px;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.08) 2px,rgba(0,0,0,0.08) 4px);pointer-events:none;z-index:100}
+body::after{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,0.55) 100%);pointer-events:none;z-index:99}
+.wrap{max-width:640px;margin:0 auto;padding:16px}
+.hdr{text-align:center;padding:24px 0 20px;border-bottom:1px solid var(--border);margin-bottom:20px}
+.hdr::before{content:'▸ NSD-DALEK UNIT 1 ◂';display:block;font-size:11px;letter-spacing:4px;color:var(--muted);margin-bottom:8px}
+.hdr h1{font-family:var(--font-d);font-size:clamp(22px,6vw,36px);font-weight:900;color:var(--red);letter-spacing:6px;text-shadow:0 0 20px rgba(255,34,0,0.6),0 0 60px rgba(255,34,0,0.2);animation:flicker 8s infinite}
+.hdr-sub{font-size:12px;letter-spacing:2px;color:var(--muted);margin-top:6px}
+@keyframes flicker{0%,95%,100%{opacity:1}96%{opacity:.85}97%{opacity:1}98%{opacity:.9}}
+@keyframes blink{50%{opacity:0}}
+.sbar{display:flex;justify-content:space-between;align-items:center;background:var(--panel);border:1px solid var(--border);padding:9px 14px;font-size:12px;letter-spacing:1px;color:var(--muted);margin-bottom:20px}
+.live{color:var(--green)}
+.live::before{content:'● ';animation:blink 1.5s step-end infinite}
+.panel{background:var(--panel);border:1px solid var(--border);padding:14px 16px;margin-bottom:14px}
+.plabel{font-size:11px;letter-spacing:3px;color:var(--muted);margin-bottom:12px;text-transform:uppercase}
+.sensors{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.sensor{text-align:center}
+.sname{font-size:11px;letter-spacing:2px;color:var(--muted);margin-bottom:6px}
+.sval{font-family:var(--font-d);font-size:26px;font-weight:700;transition:color .4s}
+.sval.ok{color:var(--green)}
+.sval.warn{color:var(--amber)}
+.sval.alert{color:var(--red);text-shadow:0 0 10px rgba(255,34,0,0.8)}
+.sunit{font-size:11px;color:var(--muted);margin-top:2px}
+.sbar-w{height:3px;background:var(--dim);margin-top:8px;overflow:hidden}
+.sbar-f{height:100%;background:var(--green);transition:width .4s,background .4s}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.cbtn{display:block;background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:var(--font-m);font-size:13px;letter-spacing:2px;text-align:center;padding:18px 8px;cursor:pointer;text-decoration:none;transition:all .15s;text-transform:uppercase;position:relative;overflow:hidden}
+.cbtn::before{content:'';position:absolute;inset:0;background:currentColor;opacity:0;transition:opacity .15s}
+.cbtn:hover::before{opacity:.06}
+.cbtn:active::before{opacity:.15}
+.cbtn-ico{display:block;font-size:24px;margin-bottom:6px;line-height:1}
+.cbtn-st{display:block;font-size:11px;letter-spacing:2px;margin-top:4px;color:var(--muted)}
+.cbtn.on{border-color:var(--green);color:var(--green)}
+.cbtn.off{border-color:var(--red);color:var(--red)}
+.cbtn.dim{opacity:.4;cursor:default}
+.vpanel{background:var(--panel);border:1px solid var(--border);padding:14px 16px;margin-bottom:14px}
+.vrow{display:flex;align-items:center;gap:12px;margin-top:10px}
+.vbtn{background:var(--dim);border:1px solid var(--border);color:var(--text);font-family:var(--font-d);font-size:20px;width:48px;height:48px;cursor:pointer;display:flex;align-items:center;justify-content:center;text-decoration:none;flex-shrink:0;transition:all .15s}
+.vbtn:hover{border-color:var(--text);background:#0f2018}
+.vtrack{flex:1;height:4px;background:var(--dim)}
+.vfill{height:100%;background:var(--amber);transition:width .4s}
+.vnum{font-family:var(--font-d);font-size:20px;font-weight:700;color:var(--amber);min-width:36px;text-align:right;flex-shrink:0}
+.infobar{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);letter-spacing:1px;padding:10px 0 4px;border-top:1px solid var(--border)}
+.rssi-ok{color:var(--green)}
+.rssi-warn{color:var(--amber)}
+.rssi-bad{color:var(--red)}
+/* Mobile: slightly larger tap targets and font sizes */
+@media(max-width:480px){
+  html,body{font-size:15px}
+  .sval{font-size:28px}
+  .cbtn{font-size:14px;padding:20px 8px}
+  .cbtn-st{font-size:12px}
+  .sbar{font-size:11px;flex-wrap:wrap;gap:4px}
+  .vbtn{width:52px;height:52px;font-size:22px}
+  .vnum{font-size:22px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hdr">
+    <h1>!! EXTERMINATE !!</h1>
+    <div class="hdr-sub">COMMAND &amp; CONTROL INTERFACE // AUTHORISED PERSONNEL ONLY</div>
+  </div>
+  <div class="sbar">
+    <span class="live" id="live-label">LIVE</span>
+    <span id="uptime-label">UPTIME: --</span>
+    <span id="rssi-label">SIGNAAL: --</span>
+  </div>
+  <div class="panel">
+    <div class="plabel">▸ Proximity sensors</div>
+    <div class="sensors">
+      <div class="sensor">
+        <div class="sname">RECHTS</div>
+        <div class="sval ok" id="sr">---</div>
+        <div class="sunit">CM</div>
+        <div class="sbar-w"><div class="sbar-f" id="br" style="width:100%"></div></div>
+      </div>
+      <div class="sensor">
+        <div class="sname">MIDDEN</div>
+        <div class="sval ok" id="sc">---</div>
+        <div class="sunit">CM</div>
+        <div class="sbar-w"><div class="sbar-f" id="bc" style="width:100%"></div></div>
+      </div>
+      <div class="sensor">
+        <div class="sname">LINKS</div>
+        <div class="sval ok" id="sl">---</div>
+        <div class="sunit">CM</div>
+        <div class="sbar-w"><div class="sbar-f" id="bl" style="width:100%"></div></div>
+      </div>
+    </div>
+  </div>
+  <div class="controls">
+    <a class="cbtn" id="btn-display" href="#" onclick="doCmd('/display/toggle');return false;">
+      <span class="cbtn-ico">&#9689;</span>
+      DISPLAY
+      <span class="cbtn-st" id="st-display">---</span>
+    </a>
+    <a class="cbtn" id="btn-motors" href="#" onclick="doCmd('/movement/toggle');return false;">
+      <span class="cbtn-ico">&#10227;</span>
+      MOTOREN
+      <span class="cbtn-st" id="st-motors">---</span>
+    </a>
+    <a class="cbtn" id="btn-sound" href="#" onclick="doCmd('/sound/toggle');return false;">
+      <span class="cbtn-ico">&#9834;</span>
+      GELUID
+      <span class="cbtn-st" id="st-sound">---</span>
+    </a>
+    <a class="cbtn dim">
+      <span class="cbtn-ico">&#9889;</span>
+      STATUS
+      <span class="cbtn-st" id="st-running">---</span>
+    </a>
+  </div>
+  <div class="vpanel">
+    <div class="plabel">▸ Volume</div>
+    <div class="vrow">
+      <a class="vbtn" href="#" onclick="doCmd('/volume/down');return false;">−</a>
+      <div class="vtrack"><div class="vfill" id="vol-fill" style="width:0%"></div></div>
+      <div class="vnum" id="vol-num">--</div>
+      <a class="vbtn" href="#" onclick="doCmd('/volume/up');return false;">+</a>
+    </div>
+  </div>
+  <div class="infobar">
+    <span>NSD-DALEK v2.0 // ESP32</span>
+    <span id="ip-label">IP: --</span>
+  </div>
+</div>
+<script>
+const MIN_CM=30,MID_CM=50,MAX_CM=300;
+function sensorClass(v){return v<=MIN_CM?'alert':v<=MID_CM?'warn':'ok'}
+function sensorColor(v){return v<=MIN_CM?'#ff2200':v<=MID_CM?'#ffaa00':'#00ff88'}
+function barWidth(v){return Math.min(100,Math.max(2,(v/MAX_CM)*100)).toFixed(1)+'%'}
+function fmtUptime(s){
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;
+  return (h>0?h+'h ':'')+((m>0||h>0)?String(m).padStart(2,'0')+'m ':'')+String(ss).padStart(2,'0')+'s';
+}
+function rssiClass(r){return r>=-60?'rssi-ok':r>=-75?'rssi-warn':'rssi-bad'}
+
+function applyStatus(d){
+  [['sr','br',d.right],['sc','bc',d.center],['sl','bl',d.left]].forEach(([vi,bi,val])=>{
+    const ve=document.getElementById(vi);
+    ve.textContent=val>=MAX_CM?'---':val;
+    ve.className='sval '+sensorClass(val);
+    const be=document.getElementById(bi);
+    be.style.width=barWidth(val);
+    be.style.background=sensorColor(val);
+  });
+  document.getElementById('btn-display').className='cbtn '+(d.display?'on':'off');
+  document.getElementById('btn-motors').className ='cbtn '+(d.motors ?'on':'off');
+  document.getElementById('btn-sound').className  ='cbtn '+(d.sound  ?'on':'off');
+  document.getElementById('st-display').textContent=d.display?'AAN':'UIT';
+  document.getElementById('st-motors').textContent =d.motors ?'AAN':'UIT';
+  document.getElementById('st-sound').textContent  =d.sound  ?'AAN':'UIT';
+  document.getElementById('st-running').textContent=d.motors ?'RIJDEND':'GESTOPT';
+  document.getElementById('vol-num').textContent=d.volume;
+  document.getElementById('vol-fill').style.width=((d.volume/30)*100).toFixed(1)+'%';
+  document.getElementById('uptime-label').textContent='UPTIME: '+fmtUptime(d.uptime);
+  const re=document.getElementById('rssi-label');
+  re.textContent='SIGNAAL: '+d.rssi+' dBm';
+  re.className=rssiClass(d.rssi);
+}
+
+function poll(){
+  fetch('/status')
+    .then(r=>r.json())
+    .then(d=>{
+      document.getElementById('live-label').textContent='LIVE';
+      applyStatus(d);
+    })
+    .catch(()=>{document.getElementById('live-label').textContent='OFFLINE'});
+}
+
+async function doCmd(url){
+  await fetch(url);
+  poll();
+}
+
+document.getElementById('ip-label').textContent='IP: '+location.hostname;
+poll();
+setInterval(poll,3000);
+</script>
+</body>
+</html>
