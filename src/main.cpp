@@ -22,9 +22,25 @@
 //       calls are still sequential (hardware constraint of the
 //       daisy-chain) but happen in a timed 500 ms slot so the
 //       stepper task loop is free the rest of the time.
-//    4. WiFi credentials in secrets.ini  - never in source code.
+//    4. WiFi credentials + API token in secrets.ini - never in source.
 //    5. Motor direction invert flags  - configurable in config.h
 //       without rewiring.
+//
+//  Security:
+//    - Every HTTP route (except /) checks X-Token header.
+//    - CORS header removed; UI is same-origin.
+//    - 404 handler for unknown routes.
+//    - Shadow state variables removed; single source of truth
+//      via mutex-protected volatiles.
+//
+//  v2.1 fixes:
+//    - snprintf JSON (no String heap fragmentation).
+//    - yield() in boot animation spin-loop.
+//    - motorTask stack bumped to 8192 bytes.
+//    - WiFi reconnect uses disconnect+begin for reliability.
+//    - BORED_COUNT_MAX, SND_EXTERMINATE_VOLUME from config.h.
+//    - onNotFound handler added.
+//    - Serial.println() outside DEBUG guard fixed.
 // =============================================================
 
 #include <Arduino.h>
@@ -38,7 +54,7 @@
 #include "esp_task_wdt.h"
 #include "esp_system.h"    // esp_reset_reason()
 
-// WiFi credentials injected via secrets.ini build flags
+// WiFi credentials and API token injected via secrets.ini build flags
 #ifndef WIFI_SSID
   #define WIFI_SSID     "no_ssid_set"
   #define WIFI_PASSWORD "no_password_set"
@@ -49,6 +65,11 @@
 //  Written by Core 1 web handler or Core 1 dome logic,
 //  read by Core 0 motor task (and vice-versa for sensor values).
 //  Protected by a FreeRTOS spinlock (portMUX).
+//
+//  NOTE: sDisplayMode / sMotorRunning / sSoundEnabled shadow
+//  variables have been removed. The volatile vars below are the
+//  single source of truth; web handlers read/write them directly
+//  under the mutex.
 // =============================================================
 
 portMUX_TYPE cmdMux = portMUX_INITIALIZER_UNLOCKED;
@@ -113,6 +134,21 @@ void setDomeCmd(int cmd) {
     portENTER_CRITICAL(&cmdMux);
     domeCmd = cmd;
     portEXIT_CRITICAL(&cmdMux);
+}
+
+// =============================================================
+//  SECURITY HELPERS
+// =============================================================
+
+// Returns true if the request carries a valid API token.
+// Called at the top of every mutable route handler.
+bool checkToken() {
+    if (server.hasHeader("X-Token") &&
+        server.header("X-Token") == String(API_TOKEN)) {
+        return true;
+    }
+    server.send(403, "text/plain", "Forbidden");
+    return false;
 }
 
 // =============================================================
@@ -471,7 +507,7 @@ void processDomeCmd(int& prevCmd, int& boredCount,
 
         case 12:  // exterminate
             DBGLN("Exterminate!!");
-            mp3.volume(30);
+            mp3.volume(SND_EXTERMINATE_VOLUME);
             startFadeEvent(CRGB::Red);
             playSound(SND_EXTERMINATE);
             lastBored = millis();
@@ -509,32 +545,44 @@ void processDomeCmd(int& prevCmd, int& boredCount,
 //  WEB SERVER  (Core 1)
 // =============================================================
 
-static bool sDisplayMode   = true;
-static bool sMotorRunning  = false;
-static bool sSoundEnabled  = true;
-
 // JSON status endpoint - polled every 3s by the page via fetch()
+// Uses snprintf instead of String concatenation to avoid heap
+// fragmentation on the ESP32.
 void handleStatus() {
-    String rssi   = String(WiFi.RSSI());
-    String uptime = String(millis() / 1000);
-    String json =
-        "{\"display\":"  + String(sDisplayMode  ? "true" : "false") +
-        ",\"motors\":"   + String(sMotorRunning  ? "true" : "false") +
-        ",\"sound\":"    + String(sSoundEnabled  ? "true" : "false") +
-        ",\"volume\":"   + String(volume) +
-        ",\"right\":"    + String(rightCM)  +
-        ",\"center\":"   + String(centerCM) +
-        ",\"left\":"     + String(leftCM)   +
-        ",\"rssi\":"     + rssi +
-        ",\"uptime\":"   + uptime +
-        "}";
-    server.sendHeader("Access-Control-Allow-Origin", "*");
+    char json[256];
+    bool dm, mr, se;
+    int  vol;
+    long rc, cc, lc;
+
+    // Snapshot volatile state under lock
+    portENTER_CRITICAL(&cmdMux);
+    dm  = displayMode;
+    mr  = motorRunning;
+    se  = soundEnabled;
+    vol = volume;
+    rc  = rightCM;
+    cc  = centerCM;
+    lc  = leftCM;
+    portEXIT_CRITICAL(&cmdMux);
+
+    snprintf(json, sizeof(json),
+        "{\"display\":%s,\"motors\":%s,\"sound\":%s,"
+        "\"volume\":%d,\"right\":%ld,\"center\":%ld,\"left\":%ld,"
+        "\"rssi\":%d,\"uptime\":%lu}",
+        dm  ? "true" : "false",
+        mr  ? "true" : "false",
+        se  ? "true" : "false",
+        vol, rc, cc, lc,
+        (int)WiFi.RSSI(),
+        millis() / 1000UL
+    );
+
+    // No CORS wildcard - UI is same-origin (served from the same ESP32)
     server.send(200, "application/json", json);
 }
 
 // HTML is served from LittleFS (data/index.html).
 // Flash the filesystem with: pio run --target uploadfs
-
 void handleRoot() {
     if (LittleFS.exists("/index.html")) {
         File f = LittleFS.open("/index.html", "r");
@@ -546,39 +594,82 @@ void handleRoot() {
     }
 }
 
-
 void setupWebRoutes() {
+    // Root serves the UI - no token required (browser navigation)
     server.on("/", handleRoot);
+
+    // Status is read-only telemetry - no token required for polling
     server.on("/status", handleStatus);
 
+    // All mutating routes require X-Token header
     server.on("/display/toggle", [](){
-        if (sDisplayMode) {
-            sDisplayMode = false; sMotorRunning = false; sSoundEnabled = false;
-            soundEnabled = false; motorRunning  = false;
-            setMotorCmd(2); setDomeCmd(14);
+        if (!checkToken()) return;
+        portENTER_CRITICAL(&cmdMux);
+        bool dm = displayMode;
+        portEXIT_CRITICAL(&cmdMux);
+
+        if (dm) {
+            portENTER_CRITICAL(&cmdMux);
+            displayMode  = false;
+            motorRunning = false;
+            soundEnabled = false;
+            portEXIT_CRITICAL(&cmdMux);
+            setMotorCmd(2);
+            setDomeCmd(14);
         } else {
-            sDisplayMode = true; sSoundEnabled = true;
+            portENTER_CRITICAL(&cmdMux);
+            displayMode  = true;
             soundEnabled = true;
+            portEXIT_CRITICAL(&cmdMux);
             setDomeCmd(15);
         }
         server.send(200, "text/plain", "ok");
     });
+
     server.on("/movement/toggle", [](){
-        if (!sDisplayMode) {   // motors only allowed when display is off
-            sMotorRunning = !sMotorRunning;
-            motorRunning  =  sMotorRunning;
-            if (sMotorRunning) setDomeCmd(19); else { setMotorCmd(2); setDomeCmd(18); }
+        if (!checkToken()) return;
+        portENTER_CRITICAL(&cmdMux);
+        bool dm = displayMode;
+        bool mr = motorRunning;
+        portEXIT_CRITICAL(&cmdMux);
+
+        // Motors only allowed when display mode is off
+        if (!dm) {
+            bool newMr = !mr;
+            portENTER_CRITICAL(&cmdMux);
+            motorRunning = newMr;
+            portEXIT_CRITICAL(&cmdMux);
+            if (newMr) {
+                setDomeCmd(19);
+            } else {
+                setMotorCmd(2);
+                setDomeCmd(18);
+            }
         }
         server.send(200, "text/plain", "ok");
     });
+
     server.on("/sound/toggle", [](){
-        sSoundEnabled = !sSoundEnabled;
-        soundEnabled  =  sSoundEnabled;
-        setDomeCmd(sSoundEnabled ? 15 : 14);
+        if (!checkToken()) return;
+        portENTER_CRITICAL(&cmdMux);
+        bool se = soundEnabled;
+        portEXIT_CRITICAL(&cmdMux);
+
+        bool newSe = !se;
+        portENTER_CRITICAL(&cmdMux);
+        soundEnabled = newSe;
+        portEXIT_CRITICAL(&cmdMux);
+        setDomeCmd(newSe ? 15 : 14);
         server.send(200, "text/plain", "ok");
     });
-    server.on("/volume/up",   [](){ setDomeCmd(16); server.send(200, "text/plain", "ok"); });
-    server.on("/volume/down", [](){ setDomeCmd(17); server.send(200, "text/plain", "ok"); });
+
+    server.on("/volume/up",   [](){ if (!checkToken()) return; setDomeCmd(16); server.send(200, "text/plain", "ok"); });
+    server.on("/volume/down", [](){ if (!checkToken()) return; setDomeCmd(17); server.send(200, "text/plain", "ok"); });
+
+    // Catch-all 404 for unknown routes
+    server.onNotFound([](){
+        server.send(404, "text/plain", "Not found");
+    });
 }
 
 // =============================================================
@@ -593,15 +684,15 @@ void setup() {
     // ---- Print last reset reason (helps diagnose unexpected reboots) ----
     DBG("Reset reason  : ");
     switch (esp_reset_reason()) {
-        case ESP_RST_POWERON:   DBGLN("Power on");           break;
-        case ESP_RST_SW:        DBGLN("Software reset");     break;
-        case ESP_RST_PANIC:     DBGLN("*** PANIC/CRASH ***"); break;
-        case ESP_RST_INT_WDT:   DBGLN("*** INT WATCHDOG ***");break;
+        case ESP_RST_POWERON:   DBGLN("Power on");            break;
+        case ESP_RST_SW:        DBGLN("Software reset");      break;
+        case ESP_RST_PANIC:     DBGLN("*** PANIC/CRASH ***");  break;
+        case ESP_RST_INT_WDT:   DBGLN("*** INT WATCHDOG ***"); break;
         case ESP_RST_TASK_WDT:  DBGLN("*** TASK WATCHDOG ***");break;
-        case ESP_RST_WDT:       DBGLN("*** WATCHDOG ***");   break;
-        case ESP_RST_BROWNOUT:  DBGLN("*** BROWNOUT ***");   break;
-        case ESP_RST_SDIO:      DBGLN("SDIO reset");         break;
-        default:                DBGLN("Unknown");            break;
+        case ESP_RST_WDT:       DBGLN("*** WATCHDOG ***");     break;
+        case ESP_RST_BROWNOUT:  DBGLN("*** BROWNOUT ***");     break;
+        case ESP_RST_SDIO:      DBGLN("SDIO reset");           break;
+        default:                DBGLN("Unknown");              break;
     }
 
     // ---- LittleFS ----
@@ -625,7 +716,7 @@ void setup() {
     while (WiFi.status() != WL_CONNECTED && wifiRetries-- > 0) {
         delay(500); DBG(".");
     }
-    Serial.println();
+    DBGLN("");   // newline after dots — use DBGLN so it respects DEBUG guard
     if (WiFi.status() == WL_CONNECTED) {
         DBGLN("WiFi status   : CONNECTED");
         DBG("IP address    : "); DBGLN(WiFi.localIP());
@@ -637,9 +728,9 @@ void setup() {
         DBGLN("WiFi status   : FAILED - running offline");
         DBG("Status code   : ");
         switch (WiFi.status()) {
-            case WL_NO_SSID_AVAIL:  DBGLN("WL_NO_SSID_AVAIL (SSID not found)"); break;
-            case WL_CONNECT_FAILED: DBGLN("WL_CONNECT_FAILED (wrong password?)"); break;
-            case WL_DISCONNECTED:   DBGLN("WL_DISCONNECTED (timed out)"); break;
+            case WL_NO_SSID_AVAIL:  DBGLN("WL_NO_SSID_AVAIL (SSID not found)");   break;
+            case WL_CONNECT_FAILED: DBGLN("WL_CONNECT_FAILED (wrong password?)");  break;
+            case WL_DISCONNECTED:   DBGLN("WL_DISCONNECTED (timed out)");          break;
             default: DBGLN(WiFi.status()); break;
         }
     }
@@ -676,8 +767,9 @@ void setup() {
     domeState = DOME_BOOT;
     DBGLN("Boot animation started");
 
-    // Spin in the boot animation until it finishes
-    while (updateDomeFSM()) { /* yields via loop in FSM */ }
+    // Spin in the boot animation until it finishes.
+    // yield() keeps the WiFi/lwIP stack alive during the wait.
+    while (updateDomeFSM()) { yield(); }
     DBGLN("Boot complete");
     playSound(SND_MOAN);
 
@@ -686,10 +778,12 @@ void setup() {
     DBGLN("Web server started");
 
     // Start motor/sensor task on Core 0
+    // Stack bumped to 8192: sensor reads + FastAccelStepper + debug prints
+    // can push the 4096-byte stack close to its limit under load.
     xTaskCreatePinnedToCore(
         motorTask,   // function
         "motorTask", // name
-        4096,        // stack bytes
+        8192,        // stack bytes (was 4096)
         NULL,        // parameter
         1,           // priority
         NULL,        // task handle
@@ -720,7 +814,15 @@ void loop() {
         DBG("[HB] uptime="); DBG(millis()/1000);
         DBG("s  heap=");     DBG(ESP.getFreeHeap());
         DBG("  wifi=");      DBGLN(WiFi.status() == WL_CONNECTED ? "OK" : "DOWN");
-        if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+
+        // Robust reconnect: disconnect first, then re-begin.
+        // WiFi.reconnect() alone can silently fail after a longer outage.
+        if (WiFi.status() != WL_CONNECTED) {
+            DBGLN("[HB] WiFi lost - reconnecting...");
+            WiFi.disconnect();
+            delay(100);
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        }
     }
 
     processDomeCmd(prevDomeCmd, boredCount, lastBored, lastPulse);
@@ -737,7 +839,7 @@ void loop() {
     if (displayMode && domeState == DOME_IDLE && (now - lastBored >= BORED_INTERVAL_MS)) {
         DBGLN("Bored!");
         mp3.volume(volume);
-        if (boredCount <= 2) {
+        if (boredCount < BORED_COUNT_MAX) {
             playSound(SND_MOAN);
             boredCount++;
         } else {

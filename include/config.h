@@ -3,7 +3,8 @@
 // =============================================================
 //  config.h  -  Dalek ESP32 unified firmware
 //  Edit pin assignments, thresholds and motor flags here.
-//  WiFi credentials live in secrets.ini (never commit that file).
+//  WiFi credentials AND API token live in secrets.ini
+//  (never commit that file).
 // =============================================================
 
 // =============================================================
@@ -11,8 +12,12 @@
 //  Comment out the #define to disable all serial output.
 //  When disabled: no Serial.begin(), zero runtime overhead,
 //  and the serial monitor will show nothing.
+//
+//  TIP: for production builds leave this commented out, or
+//  set it via secrets.ini:
+//    build_flags = ... -DDEBUG
 // =============================================================
-#define DEBUG
+// #define DEBUG
 
 #ifdef DEBUG
   #define DBG(x)   Serial.print(x)
@@ -20,6 +25,19 @@
 #else
   #define DBG(x)
   #define DBGLN(x)
+#endif
+
+// =============================================================
+//  SECURITY
+//  API_TOKEN is injected via secrets.ini as a build flag:
+//    -DAPI_TOKEN=\"your_secret_token_here\"
+//  Every HTTP request must include the header:
+//    X-Token: <your_secret_token_here>
+//  The web UI sends it automatically.
+//  If not set in secrets.ini this fallback is used — change it!
+// =============================================================
+#ifndef API_TOKEN
+  #define API_TOKEN "change_me_dalek_token"
 #endif
 
 // =============================================================
@@ -86,10 +104,12 @@
 // =============================================================
 //  SOUND / LED
 // =============================================================
-#define DEFAULT_VOLUME      30          // 0-30
-#define BORED_INTERVAL_MS   900000UL    // 15 minutes
-#define PULSE_INTERVAL_MS    10000UL    // eyestalk pulse period
-#define BOOT_DELAY_MS        3000UL     // startup animation (increase to 15000 for final build)
+#define DEFAULT_VOLUME        25          // 0-30 (was 30; slightly less aggressive)
+#define SND_EXTERMINATE_VOLUME 30         // full volume for exterminate only
+#define BORED_COUNT_MAX         3         // moans before "really bored" palette
+#define BORED_INTERVAL_MS  900000UL       // 15 minutes between bored events
+#define PULSE_INTERVAL_MS   10000UL       // eyestalk pulse period
+#define BOOT_DELAY_MS        3000UL       // startup animation (increase to 15000 for final build)
 
 // Sound folder / track numbers (match your SD card layout)
 #define SND_FOLDER          10
