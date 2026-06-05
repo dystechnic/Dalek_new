@@ -188,7 +188,11 @@ function poll(){
 }
 
 async function doCmd(url){
-  await fetch(url);
+  try {
+    await fetch(url);
+  } catch(e) {
+    document.getElementById('live-label').textContent='OFFLINE';
+  }
   poll();
 }
 

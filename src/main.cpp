@@ -180,8 +180,12 @@ void sensorAction() {
     long r = rightCM, c = centerCM, l = leftCM;
     static bool midTriggered = false;
     static bool minTriggered = false;
+    bool mr;
 
-    if (!motorRunning) return;
+    portENTER_CRITICAL(&cmdMux);
+    mr = motorRunning;
+    portEXIT_CRITICAL(&cmdMux);
+    if (!mr) return;
 
     // Movement decisions
     if (r > SONIC_MIN_CM && c > SONIC_MIN_CM && l > SONIC_MIN_CM) {
@@ -281,7 +285,12 @@ void motorTask(void* pvParameters) {
             lastSensorRead = now;
         }
 
-        if (motorRunning) {
+        bool mr;
+        portENTER_CRITICAL(&cmdMux);
+        mr = motorRunning;
+        portEXIT_CRITICAL(&cmdMux);
+
+        if (mr) {
             applyMotorCmd();
         } else {
             // Ensure stopped when movement is disabled
@@ -452,7 +461,11 @@ void startPulse() {
 }
 
 void playSound(int track) {
-    if (soundEnabled) mp3.playFolder(SND_FOLDER, track);
+    bool se;
+    portENTER_CRITICAL(&cmdMux);
+    se = soundEnabled;
+    portEXIT_CRITICAL(&cmdMux);
+    if (se) mp3.playFolder(SND_FOLDER, track);
 }
 
 // =============================================================
@@ -472,13 +485,19 @@ void processDomeCmd(int& prevCmd, int& boredCount,
 
     // Volume is always handled immediately regardless of animation state
     if (cmd == 16) {
-        if (volume < 30) { volume++; mp3.volumeUp(); }
+        portENTER_CRITICAL(&cmdMux);
+        int v = volume;
+        if (v < 30) { volume++; mp3.volumeUp(); }
+        portEXIT_CRITICAL(&cmdMux);
         DBGLN("Volume UP");
         setDomeCmd(prevCmd);
         return;
     }
     if (cmd == 17) {
-        if (volume > 0) { volume--; mp3.volumeDown(); }
+        portENTER_CRITICAL(&cmdMux);
+        int v = volume;
+        if (v > 0) { volume--; mp3.volumeDown(); }
+        portEXIT_CRITICAL(&cmdMux);
         DBGLN("Volume DOWN");
         setDomeCmd(prevCmd);
         return;
@@ -493,8 +512,11 @@ void processDomeCmd(int& prevCmd, int& boredCount,
             prevCmd = cmd;
             break;
 
-        case 11:  // stay away
-            if (displayMode) {
+        case 11: {  // stay away
+            portENTER_CRITICAL(&cmdMux);
+            bool dm11 = displayMode;
+            portEXIT_CRITICAL(&cmdMux);
+            if (dm11) {
                 DBGLN("Stay Away!!");
                 mp3.volume(volume);
                 startFadeEvent(CRGB::White);
@@ -504,6 +526,7 @@ void processDomeCmd(int& prevCmd, int& boredCount,
                 prevCmd = 10;
             }
             break;
+        }
 
         case 12:  // exterminate
             DBGLN("Exterminate!!");
@@ -516,25 +539,33 @@ void processDomeCmd(int& prevCmd, int& boredCount,
             break;
 
         case 14:
+            portENTER_CRITICAL(&cmdMux);
             soundEnabled = false;
+            portEXIT_CRITICAL(&cmdMux);
             DBGLN("Sound OFF");
             prevCmd = cmd;
             break;
 
         case 15:
+            portENTER_CRITICAL(&cmdMux);
             soundEnabled = true;
+            portEXIT_CRITICAL(&cmdMux);
             DBGLN("Sound ON");
             prevCmd = cmd;
             break;
 
         case 18:
+            portENTER_CRITICAL(&cmdMux);
             displayMode = true;
+            portEXIT_CRITICAL(&cmdMux);
             DBGLN("Display mode ON");
             prevCmd = cmd;
             break;
 
         case 19:
+            portENTER_CRITICAL(&cmdMux);
             displayMode = false;
+            portEXIT_CRITICAL(&cmdMux);
             DBGLN("Display mode OFF");
             prevCmd = cmd;
             break;
@@ -739,13 +770,13 @@ void setup() {
     // ---- DFPlayer on hardware Serial2 (non-fatal if absent) ----
     bool dfplayerOK = false;
     Serial2.begin(9600, SERIAL_8N1, PIN_DFPLAYER_RX, PIN_DFPLAYER_TX);
-    int retries = 5;
-    while (!dfplayerOK && retries-- > 0) {
+    unsigned long dfTimeout = millis() + 2500UL;
+    while (!dfplayerOK && millis() < dfTimeout) {
         if (mp3.begin(Serial2)) {
             dfplayerOK = true;
         } else {
             DBGLN("DFPlayer not ready, retrying...");
-            delay(500);
+            delay(200);
         }
     }
     if (dfplayerOK) {
@@ -753,7 +784,9 @@ void setup() {
         DBGLN("DFPlayer      : OK");
     } else {
         DBGLN("DFPlayer      : NOT FOUND - sound disabled");
+        portENTER_CRITICAL(&cmdMux);
         soundEnabled = false;
+        portEXIT_CRITICAL(&cmdMux);
     }
 
     // Sonic sensor pins
@@ -829,16 +862,24 @@ void loop() {
 
     unsigned long now = millis();
 
+    bool dm;
+    portENTER_CRITICAL(&cmdMux);
+    dm = displayMode;
+    portEXIT_CRITICAL(&cmdMux);
+
     // Eyestalk pulse every 10 s in display mode (only if idle)
-    if (displayMode && domeState == DOME_IDLE && (now - lastPulse >= PULSE_INTERVAL_MS)) {
+    if (dm && domeState == DOME_IDLE && (now - lastPulse >= PULSE_INTERVAL_MS)) {
         startPulse();
         lastPulse = now;
     }
 
     // Bored timer
-    if (displayMode && domeState == DOME_IDLE && (now - lastBored >= BORED_INTERVAL_MS)) {
+    if (dm && domeState == DOME_IDLE && (now - lastBored >= BORED_INTERVAL_MS)) {
         DBGLN("Bored!");
-        mp3.volume(volume);
+        portENTER_CRITICAL(&cmdMux);
+        int boredVol = volume;
+        portEXIT_CRITICAL(&cmdMux);
+        mp3.volume(boredVol);
         if (boredCount < BORED_COUNT_MAX) {
             playSound(SND_MOAN);
             boredCount++;
