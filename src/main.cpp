@@ -50,6 +50,7 @@
 #include <FastLED.h>
 #include <FastAccelStepper.h>
 #include <DFRobotDFPlayerMini.h>
+#include <ArduinoOTA.h>
 #include "config.h"
 #include "esp_task_wdt.h"
 #include "esp_system.h"    // esp_reset_reason()
@@ -253,6 +254,8 @@ void applyMotorCmd() {
             leftStepper->move(-MOTOR_REVERSE_STEPS);
             rightStepper->move(-MOTOR_REVERSE_STEPS);
             break;
+        default:
+            break;
     }
 }
 
@@ -267,11 +270,15 @@ void motorTask(void* pvParameters) {
         leftStepper->setDirectionPin(PIN_LEFT_DIR,  INVERT_LEFT_MOTOR);
         leftStepper->setAcceleration(MOTOR_ACCEL);
         leftStepper->setSpeedInHz(MOTOR_MAX_SPEED);
+    } else {
+        DBGLN("Left stepper  : FAILED - check PIN_LEFT_STEP");
     }
     if (rightStepper) {
         rightStepper->setDirectionPin(PIN_RIGHT_DIR, INVERT_RIGHT_MOTOR);
         rightStepper->setAcceleration(MOTOR_ACCEL);
         rightStepper->setSpeedInHz(MOTOR_MAX_SPEED);
+    } else {
+        DBGLN("Right stepper : FAILED - check PIN_RIGHT_STEP");
     }
 
     static unsigned long lastSensorRead = 0;
@@ -327,7 +334,6 @@ enum DomeState {
 
 static DomeState  domeState    = DOME_BOOT;
 static int        fadeBrightness = 0;
-static CRGB       fadeColor;
 static unsigned long domeStateStart = 0;
 static int        paletteIdx   = 0;
 static int        paletteRound = 0;
@@ -515,10 +521,11 @@ void processDomeCmd(int& prevCmd, int& boredCount,
         case 11: {  // stay away
             portENTER_CRITICAL(&cmdMux);
             bool dm11 = displayMode;
+            int  vol11 = volume;
             portEXIT_CRITICAL(&cmdMux);
             if (dm11) {
                 DBGLN("Stay Away!!");
-                mp3.volume(volume);
+                mp3.volume(vol11);
                 startFadeEvent(CRGB::White);
                 playSound(SND_STAY_AWAY);
                 lastBored = millis();
@@ -568,6 +575,8 @@ void processDomeCmd(int& prevCmd, int& boredCount,
             portEXIT_CRITICAL(&cmdMux);
             DBGLN("Display mode OFF");
             prevCmd = cmd;
+            break;
+        default:
             break;
     }
 }
@@ -704,6 +713,31 @@ void setupWebRoutes() {
 }
 
 // =============================================================
+//  OTA
+// =============================================================
+
+void setupOTA() {
+    ArduinoOTA.setHostname("nsd-dalek");
+    ArduinoOTA.setPasswordHash(OTA_PASSWORD_HASH);
+
+    ArduinoOTA.onStart([]() {
+        DBGLN("OTA: Start");
+    });
+    ArduinoOTA.onEnd([]() {
+        DBGLN("OTA: End");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        DBG("OTA: Progress "); DBG(progress / (total / 100)); DBGLN("%");
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        DBG("OTA: Error "); DBGLN(error);
+    });
+
+    ArduinoOTA.begin();
+    DBGLN("OTA ready     : OK");
+}
+
+// =============================================================
 //  SETUP  (Core 1)
 // =============================================================
 void setup() {
@@ -755,6 +789,7 @@ void setup() {
         DBG("Signal (RSSI) : "); DBG(WiFi.RSSI()); DBGLN(" dBm");
         DBG("Channel       : "); DBGLN(WiFi.channel());
         DBG("MAC address   : "); DBGLN(WiFi.macAddress());
+        setupOTA();
     } else {
         DBGLN("WiFi status   : FAILED - running offline");
         DBG("Status code   : ");
@@ -833,6 +868,7 @@ void setup() {
 // =============================================================
 void loop() {
     server.handleClient();
+    ArduinoOTA.handle();
     esp_task_wdt_reset();   // keep Core 1 watchdog happy
 
     static int           prevDomeCmd = -1;
