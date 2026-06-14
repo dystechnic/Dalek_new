@@ -589,6 +589,7 @@ void processDomeCmd(int& prevCmd, int& boredCount,
                 startFadeEvent(CRGB::White);
                 playSound(SND_STAY_AWAY);
                 lastBored = millis();
+                boredCount = 0;
                 setDomeCmd(10);
                 prevCmd = 10;
             }
@@ -601,6 +602,7 @@ void processDomeCmd(int& prevCmd, int& boredCount,
             startFadeEvent(CRGB::Red);
             playSound(SND_EXTERMINATE);
             lastBored = millis();
+            boredCount = 0;
             setDomeCmd(10);
             prevCmd = 10;
             break;
@@ -681,17 +683,23 @@ void handleStatus() {
     server.send(200, "application/json", json);
 }
 
-// ── HTML root (uit LittleFS) ──────────────────────────────────────────────────
+// ── HTML root (uit LittleFS, met token-injectie) ──────────────────────────────
 //  Upload het bestandssysteem met: pio run --target uploadfs
 void handleRoot() {
-    if (LittleFS.exists("/index.html")) {
-        File f = LittleFS.open("/index.html", "r");
-        server.streamFile(f, "text/html");
-        f.close();
-    } else {
+    if (!LittleFS.exists("/index.html")) {
         server.send(503, "text/plain",
             "Filesystem niet gevonden. Voer uit: pio run --target uploadfs");
+        return;
     }
+    File f = LittleFS.open("/index.html", "r");
+    String html = f.readString();
+    f.close();
+
+    // Vervang de placeholder %%API_TOKEN%% met de echte token, zodat de
+    // web-UI zich kan authenticeren bij muterende routes.
+    html.replace("%%API_TOKEN%%", API_TOKEN);
+
+    server.send(200, "text/html", html);
 }
 
 // ── Routes registreren ───────────────────────────────────────────────────────
