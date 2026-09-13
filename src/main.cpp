@@ -1,2395 +1,797 @@
-// =============================================================================
-//  main.cpp — Dalek ESP32 unified firmware
-//  VERSION: V0.51
+// =============================================================
+//  main.cpp  -  Dalek ESP32 unified firmware - V0.51
 //
-//  NSD-Dalek
-//
-//  Hardware:
-//    - ESP32-WROOM-32U / DevKitC V4
-//    - 2x NEMA17 + Big Easy Driver
-//    - 3x Maxbotix EZ1 ultrasonic sensors
-//    - DFPlayer Mini
-//    - 1x WS2811 eye LED
+//  Consolidates four separate Arduinos into one ESP32:
+//    - dalek_WiFi.ino   (ESP-01)    -> WiFiServer + web UI
+//    - dalek_main.ino   (Mega)      -> Ultrasonic sensors
+//    - dalek_dome.ino   (Pro Mini)  -> FastLED + DFPlayer
+//    - dalek_motors.ino (Nano)      -> stepper motors
 //
 //  Architecture:
-//    Core 0:
-//      - ultrasonic sensors
-//      - motor navigation
-//      - FastAccelStepper command handling
+//    Core 0 (motorTask)  - stepper run loop + sensor polling
+//    Core 1 (Arduino)    - WiFi server + LED + sound (setup/loop)
 //
-//    Core 1:
-//      - WiFi
-//      - WebServer
-//      - OTA
-//      - DFPlayer
-//      - dome/eye FSM
-//
-//  V0.51 changes:
-//    - Fixed /movement/toggle web route
-//    - Removed obsolete sDisplayMode / sMovementState
-//    - Real sensor hysteresis
-//    - All 8 sensor combinations handled
-//    - 2-sensor blockage => reverse
-//    - Reverse escape after MOTOR_REVERSE_ESCAPE_LIMIT cycles
-//    - 3-sensor blockage => stop
-//    - Thread-safe motor/display/sound state access
-//    - Non-blocking WiFi reconnect
-//    - OTA starts after later WiFi reconnect
-//    - DFPlayer availability tracked
-//    - Display/sound/motor controls separated
-//
-// =============================================================================
+//  Optimisations vs first version:
+//    1. FastAccelStepper  - uses ESP32 RMT hardware peripheral for
+//       step pulses; stepper timing is interrupt-driven and never
+//       misses a step regardless of what else is running.
+//    2. Non-blocking dome events  - doStayAway / doExterminate /
+//       doBored use millis() state machines instead of delay(),
+//       so the web server stays responsive during sound/light events.
+//    3. Sensor reads moved to a short sub-task window  - pulseIn
+//       calls are still sequential (hardware constraint of the
+//       daisy-chain) but happen in a timed 500 ms slot so the
+//       stepper task loop is free the rest of the time.
+//    4. WiFi credentials in secrets.ini  - never in source code.
+//    5. Motor direction invert flags  - configurable in config.h
+//       without rewiring.
+// =============================================================
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <LittleFS.h>
 #include <FastLED.h>
 #include <FastAccelStepper.h>
 #include <DFRobotDFPlayerMini.h>
 #include <ArduinoOTA.h>
-
-#include "config.h"
 #include "esp_task_wdt.h"
 #include "esp_system.h"
+#include "config.h"
 
-// =============================================================================
-//  VERSION
-// =============================================================================
+static constexpr const char* FIRMWARE_VERSION = "V0.51";
 
-static const char* FIRMWARE_VERSION = "V0.51";
-
-// =============================================================================
+// =============================================================
 //  SHARED STATE
-// =============================================================================
+//  Written by Core 1 web handler or Core 1 dome logic,
+//  read by Core 0 motor task (and vice-versa for sensor values).
+//  Protected by a FreeRTOS spinlock (portMUX).
+// =============================================================
 
 portMUX_TYPE cmdMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Motor commands:
-//
-//   1 = forward
-//   2 = stop
-//   3 = turn left
-//   4 = turn right
-//   5 = reverse
-//
-// 6/7 were used by older versions and are no longer required.
-
+// Motor commands
+//   1=forward  2=stop  3=turn left  4=turn right  5=reverse
+//   6=disable movement  7=enable movement
 volatile int  motorCmd     = 2;
 volatile bool motorRunning = false;
 
-// Dome commands:
-//
-//   10 = normal blue eye
-//   11 = Stay Away
-//   12 = Exterminate
-//   14 = sound off
-//   15 = sound on
-//   16 = volume up
-//   17 = volume down
-//   18 = display on
-//   19 = display off
+// Dome/sound commands
+//   10=normal  11=stay away  12=exterminate
+//   14=sound off  15=sound on  16=vol up  17=vol down
+//   18=display on  19=display off
+volatile int  domeCmd = 10;
 
-volatile int domeCmd = 10;
+// Sensor readings (written Core 0, read Core 1 for web display)
+volatile long rightCM = 999, centerCM = 999, leftCM = 999;
 
-// Sensor values.
-//
-// Written by Core 0.
-// Read by Core 1.
-//
-// 999 is used as "no obstacle / invalid reading".
-
-volatile long rightCM  = 999;
-volatile long centerCM = 999;
-volatile long leftCM   = 999;
-
-// Display / sound state.
-
-volatile bool displayMode = true;
+// Mode flags (written Core 1, read both cores)
+volatile bool displayMode  = true;
 volatile bool soundEnabled = true;
-volatile int  volume = DEFAULT_VOLUME;
+volatile int  volume       = DEFAULT_VOLUME;
 
-// DFPlayer availability.
-
-volatile bool dfplayerAvailable = false;
-
-// =============================================================================
+// =============================================================
 //  HARDWARE OBJECTS
-// =============================================================================
+// =============================================================
 
+// FastAccelStepper - uses RMT peripheral; no manual run() needed
 FastAccelStepperEngine stepperEngine = FastAccelStepperEngine();
-
 FastAccelStepper* leftStepper  = nullptr;
 FastAccelStepper* rightStepper = nullptr;
 
+// DFPlayer on hardware Serial2
 DFRobotDFPlayerMini mp3;
+volatile bool dfplayerAvailable = false;
 
+// FastLED
 CRGB leds[NUM_LEDS];
 
+// Web server on port 80
 WebServer server(80);
 
-// =============================================================================
-//  PALETTE
-// =============================================================================
-
+// Colour palette for "really bored" animation
 static const CRGB palette[] = {
-    CRGB::Khaki,
-    CRGB::Aqua,
-    CRGB::DarkMagenta,
-    CRGB::DarkSeaGreen,
-    CRGB::Amethyst,
-    CRGB::RosyBrown,
-    CRGB::OrangeRed,
-    CRGB::Yellow,
-    CRGB::LightCoral,
-    CRGB::OldLace
+    CRGB::Khaki, CRGB::Aqua, CRGB::DarkMagenta, CRGB::DarkSeaGreen,
+    CRGB::Amethyst, CRGB::RosyBrown, CRGB::OrangeRed, CRGB::Yellow,
+    CRGB::LightCoral, CRGB::OldLace
 };
+static const int PALETTE_SIZE = sizeof(palette) / sizeof(palette[0]);
 
-static const int PALETTE_SIZE =
-    sizeof(palette) / sizeof(palette[0]);
+// =============================================================
+//  SAFE COMMAND SETTERS  (callable from any core)
+// =============================================================
 
-// =============================================================================
-//  THREAD-SAFE STATE HELPERS
-// =============================================================================
-
-void setMotorCmd(int cmd)
-{
+void setMotorCmd(int cmd) {
     portENTER_CRITICAL(&cmdMux);
     motorCmd = cmd;
     portEXIT_CRITICAL(&cmdMux);
 }
 
-int getMotorCmd()
-{
-    int cmd;
-
-    portENTER_CRITICAL(&cmdMux);
-    cmd = motorCmd;
-    portEXIT_CRITICAL(&cmdMux);
-
-    return cmd;
-}
-
-void setMotorRunning(bool state)
-{
-    portENTER_CRITICAL(&cmdMux);
-    motorRunning = state;
-    portEXIT_CRITICAL(&cmdMux);
-}
-
-bool getMotorRunning()
-{
-    bool state;
-
-    portENTER_CRITICAL(&cmdMux);
-    state = motorRunning;
-    portEXIT_CRITICAL(&cmdMux);
-
-    return state;
-}
-
-void setDomeCmd(int cmd)
-{
+void setDomeCmd(int cmd) {
     portENTER_CRITICAL(&cmdMux);
     domeCmd = cmd;
     portEXIT_CRITICAL(&cmdMux);
 }
 
-int getDomeCmd()
-{
-    int cmd;
+// =============================================================
+//  CORE 0 TASK  -  sensors + steppers
+//
+//  FastAccelStepper generates step pulses via the RMT peripheral
+//  in the background, so this task only needs to call move/stop
+//  when the command changes.  Sensor reads happen every 500 ms;
+//  the rest of the time the task yields immediately.
+// =============================================================
 
-    portENTER_CRITICAL(&cmdMux);
-    cmd = domeCmd;
-    portEXIT_CRITICAL(&cmdMux);
+struct SensorFilter {
+    long samples[3] = {SONIC_MAX_CM, SONIC_MAX_CM, SONIC_MAX_CM};
+    uint8_t count = 0;
+    uint8_t index = 0;
+    long lastValid = SONIC_MAX_CM;
+};
 
-    return cmd;
+static SensorFilter filterRight, filterCenter, filterLeft;
+
+static long median3(long a, long b, long c) {
+    if (a > b) { long t=a; a=b; b=t; }
+    if (b > c) { long t=b; b=c; c=t; }
+    if (a > b) { long t=a; a=b; b=t; }
+    return b;
 }
 
-bool getDisplayMode()
-{
-    bool state;
-
-    portENTER_CRITICAL(&cmdMux);
-    state = displayMode;
-    portEXIT_CRITICAL(&cmdMux);
-
-    return state;
+static long filterSensor(SensorFilter& f, long pulse) {
+    if (pulse <= 0) return f.lastValid;
+    long cm = pulse / 58;
+    if (cm < 1) cm = 1;
+    if (cm > SONIC_MAX_CM) cm = SONIC_MAX_CM;
+    f.lastValid = cm;
+    f.samples[f.index] = cm;
+    f.index = (f.index + 1) % 3;
+    if (f.count < 3) f.count++;
+    if (f.count == 1) return f.samples[0];
+    if (f.count == 2) return (f.samples[0] + f.samples[1]) / 2;
+    return median3(f.samples[0], f.samples[1], f.samples[2]);
 }
 
-void setDisplayMode(bool state)
-{
-    portENTER_CRITICAL(&cmdMux);
-    displayMode = state;
-    portEXIT_CRITICAL(&cmdMux);
-}
-
-bool getSoundEnabled()
-{
-    bool state;
-
-    portENTER_CRITICAL(&cmdMux);
-    state = soundEnabled;
-    portEXIT_CRITICAL(&cmdMux);
-
-    return state;
-}
-
-void setSoundEnabled(bool state)
-{
-    portENTER_CRITICAL(&cmdMux);
-    soundEnabled = state;
-    portEXIT_CRITICAL(&cmdMux);
-}
-
-int getVolume()
-{
-    int value;
-
-    portENTER_CRITICAL(&cmdMux);
-    value = volume;
-    portEXIT_CRITICAL(&cmdMux);
-
-    return value;
-}
-
-void setVolume(int value)
-{
-    value = constrain(value, 0, 30);
-
-    portENTER_CRITICAL(&cmdMux);
-    volume = value;
-    portEXIT_CRITICAL(&cmdMux);
-}
-
-void setDFPlayerAvailable(bool state)
-{
-    portENTER_CRITICAL(&cmdMux);
-    dfplayerAvailable = state;
-    portEXIT_CRITICAL(&cmdMux);
-}
-
-bool getDFPlayerAvailable()
-{
-    bool state;
-
-    portENTER_CRITICAL(&cmdMux);
-    state = dfplayerAvailable;
-    portEXIT_CRITICAL(&cmdMux);
-
-    return state;
-}
-
-// =============================================================================
-//  SECURITY
-// =============================================================================
-
-bool checkToken()
-{
-    if (server.hasHeader("X-Token") &&
-        server.header("X-Token") == String(API_TOKEN)) {
-        return true;
-    }
-
-    server.send(403, "text/plain", "Forbidden");
-    return false;
-}
-
-// =============================================================================
-//  SENSOR NAVIGATION STATE
-// =============================================================================
-
-// Hysteresis state.
-
-static bool blockedRight  = false;
-static bool blockedCenter = false;
-static bool blockedLeft   = false;
-
-// Number of consecutive sensor cycles in which the Dalek has been forced
-// to reverse.
-
-static int reverseEscapeCounter = 0;
-
-// Alarm states.
-
-static bool midTriggered = false;
-static bool minTriggered = false;
-
-// =============================================================================
-//  SENSOR READING
-// =============================================================================
-
-long pulseToCentimeters(unsigned long pulse)
-{
-    if (pulse == 0) {
-        return SONIC_MAX_CM;
-    }
-
-    // Maxbotix PWM:
-    // approximately 58 us per cm.
-    //
-    // The previous firmware used /29/2, which is mathematically identical.
-
-    long distance = pulse / 58;
-
-    if (distance < 0) {
-        distance = 0;
-    }
-
-    if (distance > SONIC_MAX_CM) {
-        distance = SONIC_MAX_CM;
-    }
-
-    return distance;
-}
-
-void readSensors()
-{
-    // Common trigger for all three Maxbotix sensors.
-
+void readSensors() {
     digitalWrite(PIN_SONIC_TRIGGER, HIGH);
     delayMicroseconds(25);
     digitalWrite(PIN_SONIC_TRIGGER, LOW);
 
-    unsigned long rp =
-        pulseIn(PIN_SONIC_RIGHT,
-                HIGH,
-                SONIC_PULSE_TIMEOUT_US);
+    long rp = pulseIn(PIN_SONIC_RIGHT,  HIGH, SONIC_PULSE_TIMEOUT_US);
+    long cp = pulseIn(PIN_SONIC_CENTER, HIGH, SONIC_PULSE_TIMEOUT_US);
+    long lp = pulseIn(PIN_SONIC_LEFT,   HIGH, SONIC_PULSE_TIMEOUT_US);
 
-    unsigned long cp =
-        pulseIn(PIN_SONIC_CENTER,
-                HIGH,
-                SONIC_PULSE_TIMEOUT_US);
-
-    unsigned long lp =
-        pulseIn(PIN_SONIC_LEFT,
-                HIGH,
-                SONIC_PULSE_TIMEOUT_US);
-
-    long r = pulseToCentimeters(rp);
-    long c = pulseToCentimeters(cp);
-    long l = pulseToCentimeters(lp);
+    long r = filterSensor(filterRight, rp);
+    long c = filterSensor(filterCenter, cp);
+    long l = filterSensor(filterLeft, lp);
 
     portENTER_CRITICAL(&cmdMux);
-
-    rightCM  = r;
+    rightCM = r;
     centerCM = c;
-    leftCM   = l;
-
+    leftCM = l;
     portEXIT_CRITICAL(&cmdMux);
 }
 
-// =============================================================================
-//  HYSTERESIS
-// =============================================================================
-
-static inline void updateBlocked(bool& blocked, long distanceCM)
-{
-    if (!blocked) {
-
-        if (distanceCM <= SONIC_MIN_CM) {
-            blocked = true;
-        }
-
-    } else {
-
-        if (distanceCM >
-            SONIC_MIN_CM + SONIC_HYSTERESIS_CM) {
-
-            blocked = false;
-        }
+// Sticky blocked/clear state with hysteresis: a side becomes "blocked" at
+// SONIC_MIN_CM but doesn't clear again until it's SONIC_HYSTERESIS_CM
+// further out, so a reading sitting right on the threshold doesn't flip
+// the movement decision every cycle.
+static inline void updateBlocked(bool &blocked, long distanceCM) {
+    if (!blocked && distanceCM <= SONIC_MIN_CM) {
+        blocked = true;
+    } else if (blocked && distanceCM > SONIC_MIN_CM + SONIC_HYSTERESIS_CM) {
+        blocked = false;
     }
 }
 
-// =============================================================================
-//  SENSOR NAVIGATION
-// =============================================================================
-//
-// Sensor layout:
-//
-//                 FRONT
-//
-//       LEFT       CENTER       RIGHT
-//
-//
-//
-// Navigation:
-//
-//   0 blocked:
-//       forward
-//
-//   1 blocked:
-//       turn away from obstacle
-//
-//   2 blocked:
-//       reverse
-//
-//   3 blocked:
-//       stop
-//
-// Special case:
-//   If reverse has been required for MOTOR_REVERSE_ESCAPE_LIMIT consecutive
-//   cycles, choose the more open side and turn instead.
-//
-// =============================================================================
-
-void sensorAction()
-{
-    if (!getMotorRunning()) {
-        return;
-    }
-
-    long r;
-    long c;
-    long l;
-
+void sensorAction() {
+    long r, c, l;
+    bool running;
     portENTER_CRITICAL(&cmdMux);
-
-    r = rightCM;
-    c = centerCM;
-    l = leftCM;
-
+    r = rightCM; c = centerCM; l = leftCM; running = motorRunning;
     portEXIT_CRITICAL(&cmdMux);
 
-    // Update hysteresis state.
+    static bool midTriggered = false;
+    static bool minTriggered = false;
+    static bool rBlocked = false, cBlocked = false, lBlocked = false;
+    static int reverseStreak = 0;
 
-    updateBlocked(blockedRight,  r);
-    updateBlocked(blockedCenter, c);
-    updateBlocked(blockedLeft,   l);
+    updateBlocked(rBlocked, r);
+    updateBlocked(cBlocked, c);
+    updateBlocked(lBlocked, l);
 
-    // Count blocked sensors.
+    if (!running) return;
 
-    int blockedCount =
-        (blockedRight  ? 1 : 0) +
-        (blockedCenter ? 1 : 0) +
-        (blockedLeft   ? 1 : 0);
-
-    // -------------------------------------------------------------------------
-    // Alarm handling
-    // -------------------------------------------------------------------------
-
-    bool withinMid =
-        (r <= SONIC_MID_CM ||
-         c <= SONIC_MID_CM ||
-         l <= SONIC_MID_CM);
-
-    bool withinMin =
-        (r <= SONIC_MIN_CM ||
-         c <= SONIC_MIN_CM ||
-         l <= SONIC_MIN_CM);
-
-    // Reset the alarm latch only after the Dalek is clearly away again.
-
-    bool allClearForAlarmReset =
-        (r > SONIC_MID_CM + SONIC_HYSTERESIS_CM &&
-         c > SONIC_MID_CM + SONIC_HYSTERESIS_CM &&
-         l > SONIC_MID_CM + SONIC_HYSTERESIS_CM);
-
-    if (allClearForAlarmReset) {
+    if (!rBlocked && !cBlocked && !lBlocked) {
+        setMotorCmd(1);
+        setDomeCmd(10);
         midTriggered = false;
         minTriggered = false;
+        reverseStreak = 0;
+    } else if (rBlocked && cBlocked && lBlocked) {
+        setMotorCmd(2);
+        reverseStreak = 0;
+    } else if (rBlocked && !cBlocked && !lBlocked) {
+        setMotorCmd(3);
+        reverseStreak = 0;
+    } else if (!rBlocked && !cBlocked && lBlocked) {
+        setMotorCmd(4);
+        reverseStreak = 0;
+    } else if (rBlocked && cBlocked && !lBlocked) {
+        setMotorCmd(3);
+        reverseStreak = 0;
+    } else if (!rBlocked && cBlocked && lBlocked) {
+        setMotorCmd(4);
+        reverseStreak = 0;
+    } else {
+        if (reverseStreak >= MOTOR_REVERSE_ESCAPE_LIMIT) {
+            setMotorCmd(r >= l ? 4 : 3);
+            reverseStreak = 0;
+        } else {
+            setMotorCmd(5);
+            reverseStreak++;
+        }
     }
 
-    if (withinMid && !midTriggered) {
-
+    if ((r <= SONIC_MID_CM || c <= SONIC_MID_CM || l <= SONIC_MID_CM) && !midTriggered) {
         setDomeCmd(11);
         midTriggered = true;
-
-        DBGLN("[SONIC] Stay Away trigger");
     }
-
-    if (withinMin && !minTriggered) {
-
+    if ((rBlocked || cBlocked || lBlocked) && !minTriggered) {
         setDomeCmd(12);
         minTriggered = true;
-
-        DBGLN("[SONIC] Exterminate trigger");
-    }
-
-    // -------------------------------------------------------------------------
-    // Navigation
-    // -------------------------------------------------------------------------
-
-    switch (blockedCount) {
-
-        // ---------------------------------------------------------------------
-        // 0 / 3 sensors blocked
-        // ---------------------------------------------------------------------
-
-        case 0:
-
-            reverseEscapeCounter = 0;
-
-            setMotorCmd(1);
-
-            break;
-
-        // ---------------------------------------------------------------------
-        // Exactly one sensor blocked
-        // ---------------------------------------------------------------------
-
-        case 1:
-
-            reverseEscapeCounter = 0;
-
-            if (blockedRight && !blockedCenter && !blockedLeft) {
-
-                // Obstacle on right -> turn left.
-
-                setMotorCmd(3);
-            }
-            else if (!blockedRight &&
-                     !blockedCenter &&
-                     blockedLeft) {
-
-                // Obstacle on left -> turn right.
-
-                setMotorCmd(4);
-            }
-            else if (!blockedRight &&
-                     blockedCenter &&
-                     !blockedLeft) {
-
-                // Obstacle directly ahead.
-
-                setMotorCmd(5);
-                reverseEscapeCounter = 1;
-            }
-
-            break;
-
-        // ---------------------------------------------------------------------
-        // Exactly two sensors blocked
-        // ---------------------------------------------------------------------
-
-        case 2:
-
-            reverseEscapeCounter++;
-
-            // Reverse for a limited number of cycles.
-
-            if (reverseEscapeCounter <
-                MOTOR_REVERSE_ESCAPE_LIMIT) {
-
-                setMotorCmd(5);
-            }
-
-            else {
-
-                // We have been reversing long enough.
-                //
-                // Choose the side with the greatest available distance.
-
-                if (l > r) {
-
-                    DBGLN("[SONIC] Escape -> LEFT");
-
-                    setMotorCmd(3);
-
-                } else {
-
-                    DBGLN("[SONIC] Escape -> RIGHT");
-
-                    setMotorCmd(4);
-                }
-
-                reverseEscapeCounter = 0;
-            }
-
-            break;
-
-        // ---------------------------------------------------------------------
-        // All three sensors blocked
-        // ---------------------------------------------------------------------
-
-        case 3:
-
-            reverseEscapeCounter = 0;
-
-            setMotorCmd(2);
-
-            DBGLN("[SONIC] ALL BLOCKED -> STOP");
-
-            break;
     }
 }
 
-// =============================================================================
-//  MOTOR COMMAND APPLICATION
-// =============================================================================
+void applyMotorCmd() {
+    static int prevAppliedCmd = -1;
+    int cmd;
+    portENTER_CRITICAL(&cmdMux);
+    cmd = motorCmd;
+    portEXIT_CRITICAL(&cmdMux);
 
-void applyMotorCmd()
-{
-    static int previousCommand = -1;
-
-    int cmd = getMotorCmd();
-
-    if (cmd == previousCommand) {
-        return;
-    }
-
-    previousCommand = cmd;
-
-    if (!leftStepper || !rightStepper) {
-        return;
-    }
+    if (!leftStepper || !rightStepper) return;
+    if (cmd == prevAppliedCmd) return;
+    prevAppliedCmd = cmd;
 
     switch (cmd) {
-
-        // ---------------------------------------------------------------------
-        // Forward
-        // ---------------------------------------------------------------------
-
         case 1:
-
             leftStepper->setSpeedInHz(MOTOR_MAX_SPEED);
             rightStepper->setSpeedInHz(MOTOR_MAX_SPEED);
-
             leftStepper->runForward();
             rightStepper->runForward();
-
             break;
-
-        // ---------------------------------------------------------------------
-        // Stop
-        // ---------------------------------------------------------------------
-
         case 2:
-
             leftStepper->stopMove();
             rightStepper->stopMove();
-
             break;
-
-        // ---------------------------------------------------------------------
-        // Turn left
-        // ---------------------------------------------------------------------
-
         case 3:
-
-            leftStepper->setSpeedInHz(
-                MOTOR_MAX_SPEED / MOTOR_TURN_SLOW_DIV);
-
-            rightStepper->setSpeedInHz(
-                MOTOR_MAX_SPEED);
-
+            leftStepper->setSpeedInHz(MOTOR_MAX_SPEED / MOTOR_TURN_SLOW_DIV);
+            rightStepper->setSpeedInHz(MOTOR_MAX_SPEED);
             leftStepper->runForward();
             rightStepper->runForward();
-
             break;
-
-        // ---------------------------------------------------------------------
-        // Turn right
-        // ---------------------------------------------------------------------
-
         case 4:
-
-            leftStepper->setSpeedInHz(
-                MOTOR_MAX_SPEED);
-
-            rightStepper->setSpeedInHz(
-                MOTOR_MAX_SPEED / MOTOR_TURN_SLOW_DIV);
-
+            leftStepper->setSpeedInHz(MOTOR_MAX_SPEED);
+            rightStepper->setSpeedInHz(MOTOR_MAX_SPEED / MOTOR_TURN_SLOW_DIV);
             leftStepper->runForward();
             rightStepper->runForward();
-
             break;
-
-        // ---------------------------------------------------------------------
-        // Reverse
-        // ---------------------------------------------------------------------
-
         case 5:
-
-            leftStepper->setSpeedInHz(
-                MOTOR_MAX_SPEED / 2);
-
-            rightStepper->setSpeedInHz(
-                MOTOR_MAX_SPEED / 2);
-
+            leftStepper->setSpeedInHz(MOTOR_MAX_SPEED / 2);
+            rightStepper->setSpeedInHz(MOTOR_MAX_SPEED / 2);
             leftStepper->runBackward();
             rightStepper->runBackward();
-
             break;
-
         default:
-
-            leftStepper->stopMove();
-            rightStepper->stopMove();
-
             break;
     }
 }
 
-// =============================================================================
-//  MOTOR TASK — CORE 0
-// =============================================================================
-
-void motorTask(void* pvParameters)
-{
-    // Register this task with the Task Watchdog.
-
+void motorTask(void* pvParameters) {
     esp_task_wdt_add(NULL);
-
-    DBGLN("[MOTOR] Initializing FastAccelStepper");
-
+    // FastAccelStepper init (must happen on the task that owns it)
     stepperEngine.init();
 
-    leftStepper =
-        stepperEngine.stepperConnectToPin(PIN_LEFT_STEP);
-
-    rightStepper =
-        stepperEngine.stepperConnectToPin(PIN_RIGHT_STEP);
-
-    // -------------------------------------------------------------------------
-    // Left motor
-    // -------------------------------------------------------------------------
+    leftStepper  = stepperEngine.stepperConnectToPin(PIN_LEFT_STEP);
+    rightStepper = stepperEngine.stepperConnectToPin(PIN_RIGHT_STEP);
 
     if (leftStepper) {
-
-        leftStepper->setDirectionPin(
-            PIN_LEFT_DIR,
-            INVERT_LEFT_MOTOR);
-
-        leftStepper->setAcceleration(
-            MOTOR_ACCEL);
-
-        leftStepper->setSpeedInHz(
-            MOTOR_MAX_SPEED);
-
-        DBGLN("[MOTOR] Left stepper OK");
-
-    } else {
-
-        DBGLN("[MOTOR] ERROR: left stepper unavailable");
+        leftStepper->setDirectionPin(PIN_LEFT_DIR,  INVERT_LEFT_MOTOR);
+        leftStepper->setAcceleration(MOTOR_ACCEL);
+        leftStepper->setSpeedInHz(MOTOR_MAX_SPEED);
     }
-
-    // -------------------------------------------------------------------------
-    // Right motor
-    // -------------------------------------------------------------------------
-
     if (rightStepper) {
-
-        rightStepper->setDirectionPin(
-            PIN_RIGHT_DIR,
-            INVERT_RIGHT_MOTOR);
-
-        rightStepper->setAcceleration(
-            MOTOR_ACCEL);
-
-        rightStepper->setSpeedInHz(
-            MOTOR_MAX_SPEED);
-
-        DBGLN("[MOTOR] Right stepper OK");
-
-    } else {
-
-        DBGLN("[MOTOR] ERROR: right stepper unavailable");
+        rightStepper->setDirectionPin(PIN_RIGHT_DIR, INVERT_RIGHT_MOTOR);
+        rightStepper->setAcceleration(MOTOR_ACCEL);
+        rightStepper->setSpeedInHz(MOTOR_MAX_SPEED);
     }
 
-    unsigned long lastSensorRead = millis();
-
-    // -------------------------------------------------------------------------
-    // Main motor loop
-    // -------------------------------------------------------------------------
+    static unsigned long lastSensorRead = 0;
 
     for (;;) {
-
         unsigned long now = millis();
 
-        // Sensor update every 500 ms.
-
-        if (now - lastSensorRead >= 500UL) {
-
+        if (now - lastSensorRead >= 500) {
             readSensors();
-
             sensorAction();
-
             lastSensorRead = now;
         }
 
-        // ---------------------------------------------------------------------
-        // Motor enable state
-        // ---------------------------------------------------------------------
-
-        if (getMotorRunning()) {
-
+        bool mr;
+        portENTER_CRITICAL(&cmdMux);
+        mr = motorRunning;
+        portEXIT_CRITICAL(&cmdMux);
+        if (mr) {
             applyMotorCmd();
-
         } else {
-
-            // Movement disabled -> force stop.
-
-            if (leftStepper &&
-                leftStepper->isRunning()) {
-
-                leftStepper->stopMove();
-            }
-
-            if (rightStepper &&
-                rightStepper->isRunning()) {
-
-                rightStepper->stopMove();
-            }
+            // Ensure stopped when movement is disabled
+            if (leftStepper  && leftStepper->isRunning())  leftStepper->stopMove();
+            if (rightStepper && rightStepper->isRunning()) rightStepper->stopMove();
         }
-
-        // FastAccelStepper generates the actual step pulses through RMT.
 
         esp_task_wdt_reset();
 
+        // FastAccelStepper handles pulses via RMT interrupt - no run() needed.
+        // Yield to keep watchdog happy without a fixed 1 ms penalty.
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
-// =============================================================================
-//  DOME / EYE STATE MACHINE
-// =============================================================================
+// =============================================================
+//  NON-BLOCKING DOME STATE MACHINE  (Core 1)
+//
+//  Each "event" (stay away, exterminate, bored, boot, pulse) is
+//  modelled as a small state machine so loop() never blocks and
+//  the web server stays responsive throughout.
+// =============================================================
 
 enum DomeState {
-
     DOME_IDLE,
-
     DOME_FADE_UP,
     DOME_HOLD,
     DOME_FADE_DOWN,
-
     DOME_PULSE_DOWN,
     DOME_PULSE_UP,
-
     DOME_BOOT,
-
     DOME_BORED_PALETTE
 };
 
-static DomeState domeState = DOME_BOOT;
-
-static int fadeBrightness = 0;
-
+static DomeState  domeState    = DOME_BOOT;
+static int        fadeBrightness = 0;
+static CRGB       fadeColor;
 static unsigned long domeStateStart = 0;
+static int        paletteIdx   = 0;
+static int        paletteRound = 0;
 
-static int paletteIdx   = 0;
-static int paletteRound = 0;
-
-// =============================================================================
-//  DOME FSM
-// =============================================================================
-
-bool updateDomeFSM()
-{
+// Call once per loop() iteration; advances whatever animation is active.
+// Returns true while an animation is in progress (blocks new events).
+bool updateDomeFSM() {
     unsigned long now = millis();
-
-    static unsigned long lastFadeStep = 0;
-
-    bool fadeReady =
-        (now - lastFadeStep >= 16UL);
 
     switch (domeState) {
 
-        // ---------------------------------------------------------------------
-        // Idle
-        // ---------------------------------------------------------------------
-
         case DOME_IDLE:
+            return false;   // ready for next event
 
-            return false;
-
-        // ---------------------------------------------------------------------
-        // Fade up
-        // ---------------------------------------------------------------------
-
+        // ---- fade up (used for stay-away / exterminate / stalkBlue) ----
         case DOME_FADE_UP:
-
-            if (!fadeReady) {
-                return true;
-            }
-
-            lastFadeStep = now;
-
             fadeBrightness += 3;
-
-            if (fadeBrightness >= 255) {
-
-                fadeBrightness = 255;
-
-                domeState = DOME_HOLD;
-
-                domeStateStart = now;
-            }
-
-            FastLED.setBrightness(
-                fadeBrightness);
-
+            if (fadeBrightness >= 255) { fadeBrightness = 255; domeState = DOME_HOLD; domeStateStart = now; }
+            FastLED.setBrightness(fadeBrightness);
             FastLED.show();
-
             return true;
 
-        // ---------------------------------------------------------------------
-        // Hold
-        // ---------------------------------------------------------------------
-
+        // ---- hold for 2 s then fade down ----
         case DOME_HOLD:
-
-            if (now - domeStateStart >= 2000UL) {
-
-                domeState = DOME_FADE_DOWN;
-            }
-
+            if (now - domeStateStart >= 2000) { domeState = DOME_FADE_DOWN; }
             return true;
 
-        // ---------------------------------------------------------------------
-        // Fade down
-        // ---------------------------------------------------------------------
-
+        // ---- fade down then go idle ----
         case DOME_FADE_DOWN:
-
-            if (!fadeReady) {
-                return true;
-            }
-
-            lastFadeStep = now;
-
             fadeBrightness -= 3;
-
             if (fadeBrightness <= 0) {
-
                 fadeBrightness = 0;
-
                 FastLED.setBrightness(0);
                 FastLED.show();
-
                 domeState = DOME_IDLE;
-
                 return false;
             }
-
-            FastLED.setBrightness(
-                fadeBrightness);
-
+            FastLED.setBrightness(fadeBrightness);
             FastLED.show();
-
             return true;
 
-        // ---------------------------------------------------------------------
-        // Pulse down
-        // ---------------------------------------------------------------------
-
+        // ---- eyestalk pulse (dim then bright) ----
         case DOME_PULSE_DOWN:
-
-            if (!fadeReady) {
-                return true;
-            }
-
-            lastFadeStep = now;
-
             fadeBrightness -= 3;
-
-            if (fadeBrightness <= 20) {
-
-                fadeBrightness = 20;
-
-                domeState = DOME_PULSE_UP;
-            }
-
-            FastLED.setBrightness(
-                fadeBrightness);
-
+            if (fadeBrightness <= 20) { fadeBrightness = 20; domeState = DOME_PULSE_UP; }
+            FastLED.setBrightness(fadeBrightness);
             FastLED.show();
-
             return true;
-
-        // ---------------------------------------------------------------------
-        // Pulse up
-        // ---------------------------------------------------------------------
 
         case DOME_PULSE_UP:
-
-            if (!fadeReady) {
-                return true;
-            }
-
-            lastFadeStep = now;
-
             fadeBrightness += 3;
-
             if (fadeBrightness >= 255) {
-
                 fadeBrightness = 255;
-
                 FastLED.setBrightness(255);
                 FastLED.show();
-
                 domeState = DOME_IDLE;
-
                 return false;
             }
-
-            FastLED.setBrightness(
-                fadeBrightness);
-
+            FastLED.setBrightness(fadeBrightness);
             FastLED.show();
-
             return true;
 
-        // ---------------------------------------------------------------------
-        // Boot animation
-        // ---------------------------------------------------------------------
-
+        // ---- boot animation (RWY flash for BOOT_DELAY_MS) ----
         case DOME_BOOT: {
-
             static unsigned long lastFlip = 0;
-
             static int bootPhase = 0;
-
-            static CRGB bootColors[] = {
-                CRGB::Red,
-                CRGB::White,
-                CRGB::Yellow
-            };
-
-            if (now - domeStateStart >=
-                BOOT_DELAY_MS) {
-
+            static CRGB bootColors[] = { CRGB::Red, CRGB::White, CRGB::Yellow };
+            if (now - domeStateStart >= BOOT_DELAY_MS) {
                 domeState = DOME_IDLE;
-
                 return false;
             }
-
-            if (now - lastFlip >= 333UL) {
-
-                leds[0] =
-                    bootColors[bootPhase % 3];
-
+            if (now - lastFlip >= 333) {
+                leds[0] = bootColors[bootPhase % 3];
                 FastLED.setBrightness(255);
                 FastLED.show();
-
                 bootPhase++;
-
                 lastFlip = now;
             }
-
             return true;
         }
 
-        // ---------------------------------------------------------------------
-        // Bored palette
-        // ---------------------------------------------------------------------
-
+        // ---- bored palette cycle ----
         case DOME_BORED_PALETTE: {
-
             static unsigned long lastSwap = 0;
-
-            if (now - lastSwap >= 500UL) {
-
-                leds[0] =
-                    palette[paletteIdx];
-
+            if (now - lastSwap >= 500) {
+                leds[0] = palette[paletteIdx];
                 FastLED.setBrightness(255);
                 FastLED.show();
-
                 paletteIdx++;
-
                 if (paletteIdx >= PALETTE_SIZE) {
-
                     paletteIdx = 0;
                     paletteRound++;
                 }
-
                 lastSwap = now;
             }
-
             if (paletteRound >= 7) {
-
                 paletteRound = 0;
-                paletteIdx = 0;
-
+                paletteIdx   = 0;
                 domeState = DOME_IDLE;
-
                 return false;
             }
-
             return true;
         }
     }
-
     return false;
 }
 
-// =============================================================================
-//  DOME ANIMATION HELPERS
-// =============================================================================
-
-void startFadeEvent(CRGB color)
-{
-    if (!getDisplayMode()) {
-        return;
-    }
-
+// Helpers to kick off an animation
+void startFadeEvent(CRGB color) {
     leds[0] = color;
-
     fadeBrightness = 0;
-
     domeState = DOME_FADE_UP;
 }
 
-void startPulse()
-{
-    if (!getDisplayMode()) {
-        return;
-    }
-
+void startPulse() {
     leds[0] = CRGB::Blue;
-
     fadeBrightness = 255;
-
     domeState = DOME_PULSE_DOWN;
 }
 
-void playSound(int track)
-{
-    if (!getDFPlayerAvailable()) {
-        return;
-    }
-
-    if (!getSoundEnabled()) {
-        return;
-    }
-
-    mp3.playFolder(
-        SND_FOLDER,
-        track);
-}
-
-// =============================================================================
-//  DOME COMMAND PROCESSOR
-// =============================================================================
-
-void processDomeCmd(
-    int& previousCommand,
-    int& boredCount,
-    unsigned long& lastBored,
-    unsigned long& lastPulse)
-{
-    bool busy =
-        updateDomeFSM();
-
-    int cmd =
-        getDomeCmd();
-
-    // -------------------------------------------------------------------------
-    // Volume up
-    // -------------------------------------------------------------------------
-
-    if (cmd == 16) {
-
-        if (getDFPlayerAvailable()) {
-
-            int currentVolume = getVolume();
-
-            if (currentVolume < 30) {
-
-                setVolume(currentVolume + 1);
-
-                mp3.volumeUp();
-            }
-        }
-
-        DBGLN("[DOME] Volume UP");
-
-        setDomeCmd(previousCommand);
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Volume down
-    // -------------------------------------------------------------------------
-
-    if (cmd == 17) {
-
-        if (getDFPlayerAvailable()) {
-
-            int currentVolume = getVolume();
-
-            if (currentVolume > 0) {
-
-                setVolume(currentVolume - 1);
-
-                mp3.volumeDown();
-            }
-        }
-
-        DBGLN("[DOME] Volume DOWN");
-
-        setDomeCmd(previousCommand);
-
-        return;
-    }
-
-    // Don't interrupt an active animation.
-
-    if (busy ||
-        cmd == previousCommand) {
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Normal blue eye
-    // -------------------------------------------------------------------------
-
-    if (cmd == 10) {
-
-        if (getDisplayMode()) {
-
-            DBGLN("[DOME] Normal");
-
-            startFadeEvent(
-                CRGB::Blue);
-        }
-
-        previousCommand = cmd;
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Stay Away
-    // -------------------------------------------------------------------------
-
-    if (cmd == 11) {
-
-        bool display = getDisplayMode();
-
-        int currentVolume =
-            getVolume();
-
-        if (display) {
-
-            DBGLN("[DOME] STAY AWAY");
-
-            if (getDFPlayerAvailable()) {
-                mp3.volume(currentVolume);
-            }
-
-            startFadeEvent(
-                CRGB::White);
-        }
-
-        playSound(SND_STAY_AWAY);
-
-        lastBored = millis();
-        boredCount = 0;
-
-        setDomeCmd(10);
-
-        previousCommand = 10;
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Exterminate
-    // -------------------------------------------------------------------------
-
-    if (cmd == 12) {
-
-        DBGLN("[DOME] EXTERMINATE");
-
-        if (getDFPlayerAvailable()) {
-
-            mp3.volume(
-                SND_EXTERMINATE_VOLUME);
-        }
-
-        if (getDisplayMode()) {
-
-            startFadeEvent(
-                CRGB::Red);
-        }
-
-        playSound(SND_EXTERMINATE);
-
-        lastBored = millis();
-        boredCount = 0;
-
-        setDomeCmd(10);
-
-        previousCommand = 10;
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Sound OFF
-    // -------------------------------------------------------------------------
-
-    if (cmd == 14) {
-
-        setSoundEnabled(false);
-
-        DBGLN("[DOME] Sound OFF");
-
-        previousCommand = cmd;
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Sound ON
-    // -------------------------------------------------------------------------
-
-    if (cmd == 15) {
-
-        setSoundEnabled(true);
-
-        DBGLN("[DOME] Sound ON");
-
-        previousCommand = cmd;
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Display ON
-    // -------------------------------------------------------------------------
-
-    if (cmd == 18) {
-
-        setDisplayMode(true);
-
-        DBGLN("[DOME] Display ON");
-
-        previousCommand = cmd;
-
-        return;
-    }
-
-    // -------------------------------------------------------------------------
-    // Display OFF
-    // -------------------------------------------------------------------------
-
-    if (cmd == 19) {
-
-        setDisplayMode(false);
-
-        fadeBrightness = 0;
-
-        FastLED.setBrightness(0);
-        FastLED.clear(true);
-
-        DBGLN("[DOME] Display OFF");
-
-        previousCommand = cmd;
-
-        return;
-    }
-}
-
-// =============================================================================
-//  WEB SERVER — STATUS
-// =============================================================================
-
-void handleStatus()
-{
-    char json[320];
-
-    bool dm;
-    bool mr;
-    bool se;
-    bool df;
-
-    int vol;
-
-    long rc;
-    long cc;
-    long lc;
-
+void playSound(int track) {
+    bool se, available;
     portENTER_CRITICAL(&cmdMux);
+    se = soundEnabled;
+    available = dfplayerAvailable;
+    portEXIT_CRITICAL(&cmdMux);
+    if (se && available) mp3.playFolder(SND_FOLDER, track);
+}
 
-    dm  = displayMode;
-    mr  = motorRunning;
-    se  = soundEnabled;
-    df  = dfplayerAvailable;
+// =============================================================
+//  DOME COMMAND PROCESSOR  (Core 1, called from loop)
+// =============================================================
 
-    vol = volume;
+void processDomeCmd(int& prevCmd, int& boredCount,
+                    unsigned long& lastBored, unsigned long& lastPulse)
+{
+    // Don't interrupt a running animation (except volume which is instant)
+    bool busy = updateDomeFSM();
 
-    rc  = rightCM;
-    cc  = centerCM;
-    lc  = leftCM;
-
+    int cmd;
+    portENTER_CRITICAL(&cmdMux);
+    cmd = domeCmd;
     portEXIT_CRITICAL(&cmdMux);
 
-    int wifiRSSI =
-        (WiFi.status() == WL_CONNECTED)
-        ? WiFi.RSSI()
-        : 0;
-
-    snprintf(
-        json,
-        sizeof(json),
-
-        "{"
-        "\"version\":\"%s\","
-        "\"display\":%s,"
-        "\"motors\":%s,"
-        "\"sound\":%s,"
-        "\"dfplayer\":%s,"
-        "\"volume\":%d,"
-        "\"right\":%ld,"
-        "\"center\":%ld,"
-        "\"left\":%ld,"
-        "\"rssi\":%d,"
-        "\"uptime\":%lu"
-        "}",
-
-        FIRMWARE_VERSION,
-
-        dm ? "true" : "false",
-        mr ? "true" : "false",
-        se ? "true" : "false",
-        df ? "true" : "false",
-
-        vol,
-
-        rc,
-        cc,
-        lc,
-
-        wifiRSSI,
-
-        millis() / 1000UL
-    );
-
-    server.send(
-        200,
-        "application/json",
-        json);
-}
-
-// =============================================================================
-//  WEB SERVER — ROOT
-// =============================================================================
-
-void handleRoot()
-{
-    if (!LittleFS.exists("/index.html")) {
-
-        server.send(
-            503,
-            "text/plain",
-            "Filesystem niet gevonden. "
-            "Voer uit: pio run --target uploadfs");
-
+    // Volume is always handled immediately regardless of animation state
+    if (cmd == 16) {
+        bool available;
+        portENTER_CRITICAL(&cmdMux); available = dfplayerAvailable; portEXIT_CRITICAL(&cmdMux);
+        if (volume < 30) { volume++; if (available) mp3.volumeUp(); }
+        DBGLN("Volume UP");
+        setDomeCmd(prevCmd);
+        return;
+    }
+    if (cmd == 17) {
+        bool available;
+        portENTER_CRITICAL(&cmdMux); available = dfplayerAvailable; portEXIT_CRITICAL(&cmdMux);
+        if (volume > 0) { volume--; if (available) mp3.volumeDown(); }
+        DBGLN("Volume DOWN");
+        setDomeCmd(prevCmd);
         return;
     }
 
-    File f =
-        LittleFS.open(
-            "/index.html",
-            "r");
+    if (busy || cmd == prevCmd) return;
 
-    if (!f) {
+    switch (cmd) {
+        case 10:
+            DBGLN("Normal - Blue stalk");
+            startFadeEvent(CRGB::Blue);
+            prevCmd = cmd;
+            break;
 
-        server.send(
-            500,
-            "text/plain",
-            "Kan index.html niet openen");
-
-        return;
-    }
-
-    String html =
-        f.readString();
-
-    f.close();
-
-    html.replace(
-        "%%API_TOKEN%%",
-        API_TOKEN);
-
-    server.send(
-        200,
-        "text/html",
-        html);
-}
-
-// =============================================================================
-//  WEB SERVER — MOTOR TOGGLE
-// =============================================================================
-
-void handleMovementToggle()
-{
-    if (!checkToken()) {
-        return;
-    }
-
-    bool running =
-        getMotorRunning();
-
-    if (running) {
-
-        // ---------------------------------------------------------------------
-        // Turn motors OFF
-        // ---------------------------------------------------------------------
-
-        setMotorRunning(false);
-
-        setMotorCmd(2);
-
-        reverseEscapeCounter = 0;
-
-        DBGLN("[WEB] Motors OFF");
-
-    } else {
-
-        // ---------------------------------------------------------------------
-        // Turn motors ON
-        // ---------------------------------------------------------------------
-
-        setMotorRunning(true);
-
-        // Start with a fresh navigation decision.
-
-        reverseEscapeCounter = 0;
-
-        DBGLN("[WEB] Motors ON");
-    }
-
-    server.send(
-        200,
-        "text/plain",
-        "ok");
-}
-
-// =============================================================================
-//  WEB SERVER — MOTOR ON COMPATIBILITY ROUTE
-// =============================================================================
-
-void handleMovementOn()
-{
-    if (!checkToken()) {
-        return;
-    }
-
-    setMotorRunning(true);
-
-    reverseEscapeCounter = 0;
-
-    DBGLN("[WEB] Motors ON");
-
-    server.send(
-        200,
-        "text/plain",
-        "ok");
-}
-
-// =============================================================================
-//  WEB SERVER — MOTOR OFF
-// =============================================================================
-
-void handleMovementOff()
-{
-    if (!checkToken()) {
-        return;
-    }
-
-    setMotorRunning(false);
-
-    setMotorCmd(2);
-
-    reverseEscapeCounter = 0;
-
-    DBGLN("[WEB] Motors OFF");
-
-    server.send(
-        200,
-        "text/plain",
-        "ok");
-}
-
-// =============================================================================
-//  WEB SERVER ROUTES
-// =============================================================================
-
-void setupWebRoutes()
-{
-    // -------------------------------------------------------------------------
-    // Root
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/",
-        handleRoot);
-
-    // -------------------------------------------------------------------------
-    // Read-only status
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/status",
-        handleStatus);
-
-    // -------------------------------------------------------------------------
-    // Display toggle
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/display/toggle",
-        []() {
-
-            if (!checkToken()) {
-                return;
+        case 11:  // stay away
+            if (displayMode) {
+                DBGLN("Stay Away!!");
+                mp3.volume(volume);
+                startFadeEvent(CRGB::White);
+                playSound(SND_STAY_AWAY);
+                lastBored = millis();
+                setDomeCmd(10);
+                prevCmd = 10;
             }
+            break;
 
-            bool current =
-                getDisplayMode();
+        case 12:  // exterminate
+            DBGLN("Exterminate!!");
+            mp3.volume(30);
+            startFadeEvent(CRGB::Red);
+            playSound(SND_EXTERMINATE);
+            lastBored = millis();
+            setDomeCmd(10);
+            prevCmd = 10;
+            break;
 
-            if (current) {
+        case 14:
+            soundEnabled = false;
+            DBGLN("Sound OFF");
+            prevCmd = cmd;
+            break;
 
-                // Display OFF.
+        case 15:
+            soundEnabled = true;
+            DBGLN("Sound ON");
+            prevCmd = cmd;
+            break;
 
-                setDisplayMode(false);
+        case 18:
+            displayMode = true;
+            DBGLN("Display mode ON");
+            prevCmd = cmd;
+            break;
 
-                // Turning the display off also stops motors and sound,
-                // preserving the behaviour of the existing UI.
-
-                setMotorRunning(false);
-                setMotorCmd(2);
-
-                setSoundEnabled(false);
-
-                setDomeCmd(19);
-
-                DBGLN("[WEB] Display OFF");
-
-            } else {
-
-                // Display ON.
-
-                setDisplayMode(true);
-                setSoundEnabled(true);
-
-                setDomeCmd(18);
-
-                DBGLN("[WEB] Display ON");
-            }
-
-            server.send(
-                200,
-                "text/plain",
-                "ok");
-        });
-
-    // -------------------------------------------------------------------------
-    // Motor toggle
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/movement/toggle",
-        handleMovementToggle);
-
-    // -------------------------------------------------------------------------
-    // Motor ON compatibility route
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/movement/on",
-        handleMovementOn);
-
-    // -------------------------------------------------------------------------
-    // Motor OFF
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/movement/off",
-        handleMovementOff);
-
-    // -------------------------------------------------------------------------
-    // Sound toggle
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/sound/toggle",
-        []() {
-
-            if (!checkToken()) {
-                return;
-            }
-
-            bool current =
-                getSoundEnabled();
-
-            bool newState =
-                !current;
-
-            setSoundEnabled(newState);
-
-            setDomeCmd(
-                newState ? 15 : 14);
-
-            server.send(
-                200,
-                "text/plain",
-                "ok");
-        });
-
-    // -------------------------------------------------------------------------
-    // Volume
-    // -------------------------------------------------------------------------
-
-    server.on(
-        "/volume/up",
-        []() {
-
-            if (!checkToken()) {
-                return;
-            }
-
-            setDomeCmd(16);
-
-            server.send(
-                200,
-                "text/plain",
-                "ok");
-        });
-
-    server.on(
-        "/volume/down",
-        []() {
-
-            if (!checkToken()) {
-                return;
-            }
-
-            setDomeCmd(17);
-
-            server.send(
-                200,
-                "text/plain",
-                "ok");
-        });
-
-    // -------------------------------------------------------------------------
-    // 404
-    // -------------------------------------------------------------------------
-
-    server.onNotFound(
-        []() {
-
-            server.send(
-                404,
-                "text/plain",
-                "Niet gevonden");
-        });
+        case 19:
+            displayMode = false;
+            DBGLN("Display mode OFF");
+            prevCmd = cmd;
+            break;
+    }
 }
 
-// =============================================================================
-//  OTA
-// =============================================================================
+// =============================================================
+//  WEB SERVER  (Core 1)
+// =============================================================
 
-static bool otaStarted = false;
-
-void setupOTA()
-{
-    if (otaStarted) {
-        return;
+bool checkToken() {
+    if (server.hasHeader("X-Token") && server.header("X-Token") == String(API_TOKEN)) {
+        return true;
     }
-
-    if (WiFi.status() != WL_CONNECTED) {
-        return;
-    }
-
-    ArduinoOTA.setHostname(
-        "nsd-dalek");
-
-    ArduinoOTA.setPasswordHash(
-        OTA_PASSWORD_HASH);
-
-    ArduinoOTA.onStart(
-        []() {
-
-            DBGLN("[OTA] Start");
-
-            // Stop motors immediately during OTA.
-
-            setMotorRunning(false);
-            setMotorCmd(2);
-        });
-
-    ArduinoOTA.onEnd(
-        []() {
-
-            DBGLN("[OTA] End");
-        });
-
-    ArduinoOTA.onProgress(
-        [](unsigned int progress,
-           unsigned int total) {
-
-            if (total == 0) {
-                return;
-            }
-
-            unsigned int percent =
-                (progress * 100U) / total;
-
-            DBG("[OTA] ");
-            DBG(percent);
-            DBGLN("%");
-        });
-
-    ArduinoOTA.onError(
-        [](ota_error_t error) {
-
-            DBG("[OTA] Error: ");
-            DBGLN(error);
-        });
-
-    ArduinoOTA.begin();
-
-    otaStarted = true;
-
-    DBGLN("[OTA] Ready");
+    server.send(403, "text/plain", "Forbidden");
+    return false;
 }
 
-// =============================================================================
-//  WIFI
-// =============================================================================
-
-static unsigned long wifiReconnectStarted = 0;
-
-static bool wifiReconnectPending = false;
-
-void startWiFiReconnect()
-{
-    if (wifiReconnectPending) {
-        return;
-    }
-
-    DBGLN("[WIFI] Reconnect gestart");
-
-    WiFi.disconnect();
-
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD);
-
-    wifiReconnectStarted = millis();
-
-    wifiReconnectPending = true;
+void handleRoot() {
+    const char html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DALEK COMMAND</title><style>
+body{background:#050a07;color:#c8ffe8;font-family:monospace;text-align:center;margin:20px}
+button{font-size:22px;padding:14px;margin:5px;min-width:150px;background:#0a1410;color:#c8ffe8;border:1px solid #1a3a28}
+.on{border-color:#00ff88}.off{border-color:#ff2200}.sensor{font-size:24px;margin:10px}
+</style></head><body><h1>!! EXTERMINATE !!</h1>
+<div class="sensor">R: <span id="r">---</span> cm | C: <span id="c">---</span> cm | L: <span id="l">---</span> cm</div>
+<div><button onclick="cmd('/display/toggle')">DISPLAY</button><button onclick="cmd('/movement/toggle')">MOTOREN</button></div>
+<div><button onclick="cmd('/sound/toggle')">GELUID</button></div>
+<div><button onclick="cmd('/volume/down')">− VOLUME</button><span id="v">--</span><button onclick="cmd('/volume/up')">+ VOLUME</button></div>
+<p id="status">LIVE</p><script>
+const token='%%API_TOKEN%%';
+async function cmd(u){try{await fetch(u,{headers:{'X-Token':token}});poll()}catch(e){document.getElementById('status').textContent='OFFLINE'}}
+async function poll(){try{let r=await fetch('/status');let d=await r.json();
+for(let x of [['r',d.right],['c',d.center],['l',d.left]])document.getElementById(x[0]).textContent=x[1]>=300?'---':x[1];
+document.getElementById('v').textContent=d.volume;document.getElementById('status').textContent='LIVE | '+d.version+' | '+(d.motors?'RIJDEND':'GESTOPT');
+}catch(e){document.getElementById('status').textContent='OFFLINE'}}poll();setInterval(poll,3000);
+</script></body></html>)rawliteral";
+    String page = FPSTR(html);
+    page.replace("%%API_TOKEN%%", API_TOKEN);
+    server.send(200,"text/html",page);
 }
 
-void processWiFi()
-{
-    if (WiFi.status() == WL_CONNECTED) {
+void handleStatus() {
+    bool dm,mr,se,df;
+    int vol;
+    long r,c,l;
+    portENTER_CRITICAL(&cmdMux);
+    dm=displayMode; mr=motorRunning; se=soundEnabled; vol=volume;
+    r=rightCM; c=centerCM; l=leftCM; df=dfplayerAvailable;
+    portEXIT_CRITICAL(&cmdMux);
+    char json[384];
+    snprintf(json,sizeof(json),
+        "{\"version\":\"%s\",\"display\":%s,\"motors\":%s,\"sound\":%s,\"dfplayer\":%s,\"volume\":%d,\"right\":%ld,\"center\":%ld,\"left\":%ld,\"rssi\":%d,\"uptime\":%lu}",
+        FIRMWARE_VERSION,dm?"true":"false",mr?"true":"false",se?"true":"false",df?"true":"false",
+        vol,r,c,l,(int)WiFi.RSSI(),millis()/1000UL);
+    server.send(200,"application/json",json);
+}
 
-        if (wifiReconnectPending) {
+void setupWebRoutes() {
+    const char* headerKeys[] = {"X-Token"};
+    server.collectHeaders(headerKeys, 1);
+    server.on("/", handleRoot);
+    server.on("/status", handleStatus);
 
-            wifiReconnectPending = false;
-
-            DBGLN("[WIFI] Verbonden");
-
-            DBG("[WIFI] IP: ");
-            DBGLN(WiFi.localIP());
-
-            setupOTA();
+    server.on("/display/toggle", [](){
+        if(!checkToken()) return;
+        bool dm; portENTER_CRITICAL(&cmdMux); dm=displayMode; portEXIT_CRITICAL(&cmdMux);
+        if(dm){
+            portENTER_CRITICAL(&cmdMux); displayMode=false; motorRunning=false; soundEnabled=false; portEXIT_CRITICAL(&cmdMux);
+            setMotorCmd(2); setDomeCmd(14);
+        }else{
+            portENTER_CRITICAL(&cmdMux); displayMode=true; soundEnabled=true; portEXIT_CRITICAL(&cmdMux);
+            setDomeCmd(15);
         }
-
-        return;
-    }
-
-    if (!wifiReconnectPending) {
-        return;
-    }
-
-    // Give the connection attempt up to 10 seconds.
-
-    if (millis() - wifiReconnectStarted >=
-        10000UL) {
-
-        wifiReconnectPending = false;
-
-        DBGLN(
-            "[WIFI] Verbinding mislukt");
-    }
+        server.send(200,"text/plain","ok");
+    });
+    server.on("/movement/toggle", [](){
+        if(!checkToken()) return;
+        bool mr; portENTER_CRITICAL(&cmdMux); mr=motorRunning; portEXIT_CRITICAL(&cmdMux);
+        portENTER_CRITICAL(&cmdMux); motorRunning=!mr; portEXIT_CRITICAL(&cmdMux);
+        if(mr) setMotorCmd(2); else setDomeCmd(19);
+        server.send(200,"text/plain","ok");
+    });
+    server.on("/movement/on", [](){
+        if(!checkToken()) return;
+        portENTER_CRITICAL(&cmdMux); motorRunning=true; portEXIT_CRITICAL(&cmdMux);
+        setDomeCmd(19); server.send(200,"text/plain","ok");
+    });
+    server.on("/movement/off", [](){
+        if(!checkToken()) return;
+        portENTER_CRITICAL(&cmdMux); motorRunning=false; portEXIT_CRITICAL(&cmdMux);
+        setMotorCmd(2); setDomeCmd(18); server.send(200,"text/plain","ok");
+    });
+    server.on("/sound/toggle", [](){
+        if(!checkToken()) return;
+        bool se; portENTER_CRITICAL(&cmdMux); se=soundEnabled; portEXIT_CRITICAL(&cmdMux);
+        portENTER_CRITICAL(&cmdMux); soundEnabled=!se; portEXIT_CRITICAL(&cmdMux);
+        setDomeCmd(se?14:15); server.send(200,"text/plain","ok");
+    });
+    server.on("/volume/up", [](){if(!checkToken())return;setDomeCmd(16);server.send(200,"text/plain","ok");});
+    server.on("/volume/down", [](){if(!checkToken())return;setDomeCmd(17);server.send(200,"text/plain","ok");});
+    server.onNotFound([](){server.send(404,"text/plain","Niet gevonden");});
 }
 
-// =============================================================================
-//  SETUP
-// =============================================================================
+void setupOTA() {
+    ArduinoOTA.setHostname("nsd-dalek");
+    ArduinoOTA.setPasswordHash(OTA_PASSWORD_HASH);
+    ArduinoOTA.onStart([](){DBGLN("OTA: Start");});
+    ArduinoOTA.onEnd([](){DBGLN("OTA: Einde");});
+    ArduinoOTA.onProgress([](unsigned int progress,unsigned int total){
+        DBG("OTA: "); DBG(progress/(total/100)); DBGLN("%");
+    });
+    ArduinoOTA.onError([](ota_error_t error){DBG("OTA fout: ");DBGLN(error);});
+    ArduinoOTA.begin();
+    DBGLN("OTA klaar      : OK");
+}
 
-void setup()
-{
-#ifdef DEBUG
+// =============================================================
+//  SETUP  (Core 1)
+// =============================================================
+void setup() {
     Serial.begin(115200);
+    DBGLN("\n\n========================================");
+    DBG("Dalek firmware : "); DBGLN(FIRMWARE_VERSION);
+    DBG("Reset-reden   : "); DBGLN(esp_reset_reason());
 
-    delay(50);
-#endif
-
-    DBGLN("");
-    DBGLN("");
-    DBGLN("========================================");
-    DBGLN("   NSD DALEK ESP32");
-    DBG("   Firmware: ");
-    DBGLN(FIRMWARE_VERSION);
-    DBGLN("========================================");
-
-    // -------------------------------------------------------------------------
-    // Reset reason
-    // -------------------------------------------------------------------------
-
-    DBG("[BOOT] Reset reason: ");
-
-    switch (esp_reset_reason()) {
-
-        case ESP_RST_POWERON:
-            DBGLN("Power on");
-            break;
-
-        case ESP_RST_SW:
-            DBGLN("Software reset");
-            break;
-
-        case ESP_RST_PANIC:
-            DBGLN("PANIC / CRASH");
-            break;
-
-        case ESP_RST_INT_WDT:
-            DBGLN("Interrupt watchdog");
-            break;
-
-        case ESP_RST_TASK_WDT:
-            DBGLN("Task watchdog");
-            break;
-
-        case ESP_RST_WDT:
-            DBGLN("Watchdog");
-            break;
-
-        case ESP_RST_BROWNOUT:
-            DBGLN("BROWNOUT");
-            break;
-
-        case ESP_RST_SDIO:
-            DBGLN("SDIO reset");
-            break;
-
-        default:
-            DBGLN("Unknown");
-            break;
-    }
-
-    // -------------------------------------------------------------------------
-    // LittleFS
-    // -------------------------------------------------------------------------
-
-    if (LittleFS.begin(true)) {
-
-        DBGLN("[FS] LittleFS OK");
-
-    } else {
-
-        DBGLN("[FS] LittleFS ERROR");
-    }
-
-    // -------------------------------------------------------------------------
-    // FastLED
-    // -------------------------------------------------------------------------
-
-    FastLED
-        .addLeds<
-            LED_CHIPSET,
-            PIN_LED_DATA,
-            LED_COLOR_ORDER
-        >(leds, NUM_LEDS)
-        .setCorrection(
-            Typical8mmPixel);
-
+    FastLED.addLeds<LED_CHIPSET, PIN_LED_DATA, LED_COLOR_ORDER>(leds, NUM_LEDS)
+           .setCorrection(Typical8mmPixel);
     FastLED.clear(true);
 
-    // -------------------------------------------------------------------------
-    // Sensor pins
-    // -------------------------------------------------------------------------
-
-    pinMode(
-        PIN_SONIC_TRIGGER,
-        OUTPUT);
-
-    digitalWrite(
-        PIN_SONIC_TRIGGER,
-        LOW);
-
-    pinMode(
-        PIN_SONIC_RIGHT,
-        INPUT);
-
-    pinMode(
-        PIN_SONIC_CENTER,
-        INPUT);
-
-    pinMode(
-        PIN_SONIC_LEFT,
-        INPUT);
-
-    // -------------------------------------------------------------------------
-    // WiFi
-    // -------------------------------------------------------------------------
-
-    DBGLN("----------------------------------------");
-    DBG("[WIFI] SSID: ");
-    DBGLN(WIFI_SSID);
-
-    WiFi.mode(WIFI_STA);
-
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD);
-
-    unsigned long wifiStart =
-        millis();
-
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - wifiStart < 10000UL) {
-
-        delay(250);
-
-        DBG(".");
+    Serial2.begin(9600, SERIAL_8N1, PIN_DFPLAYER_RX, PIN_DFPLAYER_TX);
+    bool dfOK=false;
+    int retries=10;
+    while(!dfOK && retries-- > 0){
+        if(mp3.begin(Serial2)) dfOK=true;
+        else {DBGLN("DFPlayer not ready, retrying...");delay(250);}
     }
+    portENTER_CRITICAL(&cmdMux); dfplayerAvailable=dfOK; if(!dfOK) soundEnabled=false; portEXIT_CRITICAL(&cmdMux);
+    if(dfOK){mp3.volume(DEFAULT_VOLUME);DBGLN("DFPlayer      : OK");}
+    else DBGLN("DFPlayer      : NIET GEVONDEN — geluid uitgeschakeld");
 
-    DBGLN("");
+    pinMode(PIN_SONIC_TRIGGER,OUTPUT);
+    pinMode(PIN_SONIC_RIGHT,INPUT);
+    pinMode(PIN_SONIC_CENTER,INPUT);
+    pinMode(PIN_SONIC_LEFT,INPUT);
 
-    if (WiFi.status() == WL_CONNECTED) {
-
-        DBGLN("[WIFI] CONNECTED");
-
-        DBG("[WIFI] IP: ");
-        DBGLN(WiFi.localIP());
-
-        DBG("[WIFI] Gateway: ");
-        DBGLN(WiFi.gatewayIP());
-
-        DBG("[WIFI] RSSI: ");
-        DBG(WiFi.RSSI());
-        DBGLN(" dBm");
-
-        DBG("[WIFI] Channel: ");
-        DBGLN(WiFi.channel());
-
-        DBG("[WIFI] MAC: ");
-        DBGLN(WiFi.macAddress());
-
-        setupOTA();
-
-    } else {
-
-        DBGLN(
-            "[WIFI] Offline mode");
-    }
-
-    DBGLN("----------------------------------------");
-
-    // -------------------------------------------------------------------------
-    // DFPlayer
-    // -------------------------------------------------------------------------
-
-    Serial2.begin(
-        9600,
-        SERIAL_8N1,
-        PIN_DFPLAYER_RX,
-        PIN_DFPLAYER_TX);
-
-    bool dfOK = false;
-
-    unsigned long dfStart =
-        millis();
-
-    while (!dfOK &&
-           millis() - dfStart < 2500UL) {
-
-        if (mp3.begin(Serial2)) {
-
-            dfOK = true;
-
-        } else {
-
-            DBGLN(
-                "[DFPLAYER] Retry");
-
-            delay(200);
-        }
-    }
-
-    if (dfOK) {
-
-        setDFPlayerAvailable(true);
-
-        mp3.volume(
-            DEFAULT_VOLUME);
-
-        DBGLN(
-            "[DFPLAYER] OK");
-
-    } else {
-
-        setDFPlayerAvailable(false);
-        setSoundEnabled(false);
-
-        DBGLN(
-            "[DFPLAYER] NOT FOUND");
-    }
-
-    // -------------------------------------------------------------------------
-    // Dome boot animation
-    // -------------------------------------------------------------------------
-
-    domeStateStart = millis();
-
-    domeState = DOME_BOOT;
-
-    DBGLN(
-        "[DOME] Boot animation");
-
-    while (updateDomeFSM()) {
-
-        yield();
-    }
-
-    DBGLN(
-        "[DOME] Boot complete");
-
-    // -------------------------------------------------------------------------
-    // Startup sound
-    // -------------------------------------------------------------------------
-
+    domeStateStart=millis(); domeState=DOME_BOOT;
+    DBGLN("Boot animation started");
+    while(updateDomeFSM()) { yield(); }
+    DBGLN("Boot complete");
     playSound(SND_MOAN);
 
-    // -------------------------------------------------------------------------
-    // Webserver
-    // -------------------------------------------------------------------------
+    DBGLN("----------------------------------------");
+    DBG("WiFi SSID     : "); DBGLN(WIFI_SSID);
+    DBGLN("Verbinden...");
+    WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+    int wifiRetries=40;
+    while(WiFi.status()!=WL_CONNECTED && wifiRetries-- > 0){delay(500);DBG(".");}
+    DBGLN("");
+    if(WiFi.status()==WL_CONNECTED){
+        DBGLN("WiFi-status   : VERBONDEN");
+        DBG("IP-adres      : "); DBGLN(WiFi.localIP());
+        DBG("Gateway       : "); DBGLN(WiFi.gatewayIP());
+        DBG("Signaal (RSSI): "); DBG(WiFi.RSSI()); DBGLN(" dBm");
+        DBG("Kanaal        : "); DBGLN(WiFi.channel());
+        DBG("MAC-adres     : "); DBGLN(WiFi.macAddress());
+        setupOTA();
+    }else{
+        DBGLN("WiFi-status   : FOUT — offline modus");
+    }
+    DBGLN("----------------------------------------");
 
     setupWebRoutes();
-
     server.begin();
+    DBGLN("Web server started");
 
-    DBGLN(
-        "[WEB] Server started");
-
-    // -------------------------------------------------------------------------
-    // Motor task
-    // -------------------------------------------------------------------------
-
-    BaseType_t taskResult =
-        xTaskCreatePinnedToCore(
-            motorTask,
-            "motorTask",
-            8192,
-            NULL,
-            1,
-            NULL,
-            0);
-
-    if (taskResult == pdPASS) {
-
-        DBGLN(
-            "[MOTOR] Task started on Core 0");
-
-    } else {
-
-        DBGLN(
-            "[MOTOR] ERROR: task creation failed");
-    }
-
-    // -------------------------------------------------------------------------
-    // Initial eye
-    // -------------------------------------------------------------------------
-
-    setDisplayMode(true);
-
-    startFadeEvent(
-        CRGB::Blue);
-
-    DBGLN(
-        "[BOOT] Startup complete");
+    xTaskCreatePinnedToCore(motorTask,"motorTask",8192,NULL,1,NULL,0);
+    DBGLN("Motor task started on Core 0");
+    startFadeEvent(CRGB::Blue);
 }
 
-// =============================================================================
-//  LOOP — CORE 1
-// =============================================================================
-
-void loop()
-{
-    // -------------------------------------------------------------------------
-    // Webserver
-    // -------------------------------------------------------------------------
-
+// =============================================================
+//  LOOP  (Core 1)  -  web server + dome FSM
+// =============================================================
+void loop() {
     server.handleClient();
-
-    // -------------------------------------------------------------------------
-    // OTA
-    // -------------------------------------------------------------------------
-
-    if (otaStarted) {
-        ArduinoOTA.handle();
-    }
-
-    // -------------------------------------------------------------------------
-    // WiFi
-    // -------------------------------------------------------------------------
-
-    processWiFi();
-
-    // -------------------------------------------------------------------------
-    // Watchdog
-    // -------------------------------------------------------------------------
-
+    ArduinoOTA.handle();
     esp_task_wdt_reset();
 
-    // -------------------------------------------------------------------------
-    // Persistent state
-    // -------------------------------------------------------------------------
+    static int prevDomeCmd=-1;
+    static int boredCount=0;
+    static unsigned long lastBored=millis();
+    static unsigned long lastPulse=millis();
+    static unsigned long lastHB=millis();
 
-    static int previousDomeCmd = -1;
-
-    static int boredCount = 0;
-
-    static unsigned long lastBored =
-        millis();
-
-    static unsigned long lastPulse =
-        millis();
-
-    static unsigned long lastHeartbeat =
-        millis();
-
-    static unsigned long lastWiFiRetry =
-        millis();
-
-    unsigned long now =
-        millis();
-
-    // -------------------------------------------------------------------------
-    // Heartbeat
-    // -------------------------------------------------------------------------
-
-    if (now - lastHeartbeat >=
-        30000UL) {
-
-        lastHeartbeat = now;
-
-        DBG("[HB] uptime=");
-        DBG(now / 1000UL);
-
-        DBG("s heap=");
-        DBG(ESP.getFreeHeap());
-
-        DBG(" wifi=");
-
-        if (WiFi.status() == WL_CONNECTED) {
-            DBGLN("OK");
-        } else {
-            DBGLN("DOWN");
+    if(millis()-lastHB>=30000UL){
+        lastHB=millis();
+        DBG("[HB] uptime=");DBG(millis()/1000);DBG("s heap=");DBG(ESP.getFreeHeap());
+        DBGLN(WiFi.status()==WL_CONNECTED?" wifi=OK":" wifi=DOWN");
+        if(WiFi.status()!=WL_CONNECTED){
+            DBGLN("[HB] WiFi verloren — opnieuw verbinden...");
+            WiFi.disconnect(false);
+            WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // WiFi reconnect request
-    // -------------------------------------------------------------------------
+    processDomeCmd(prevDomeCmd,boredCount,lastBored,lastPulse);
+    unsigned long now=millis();
+    bool dm; portENTER_CRITICAL(&cmdMux); dm=displayMode; portEXIT_CRITICAL(&cmdMux);
 
-    if (WiFi.status() != WL_CONNECTED &&
-        !wifiReconnectPending &&
-        now - lastWiFiRetry >= 30000UL) {
-
-        lastWiFiRetry = now;
-
-        startWiFiReconnect();
+    if(dm && domeState==DOME_IDLE && now-lastPulse>=PULSE_INTERVAL_MS){startPulse();lastPulse=now;}
+    if(dm && domeState==DOME_IDLE && now-lastBored>=BORED_INTERVAL_MS){
+        int boredVol; bool available;
+        portENTER_CRITICAL(&cmdMux); boredVol=volume; available=dfplayerAvailable; portEXIT_CRITICAL(&cmdMux);
+        if(available) mp3.volume(boredVol);
+        if(boredCount<BORED_COUNT_MAX){playSound(SND_MOAN);boredCount++;}
+        else{playSound(SND_REALLY_BORED);paletteIdx=0;paletteRound=0;domeState=DOME_BORED_PALETTE;boredCount=0;}
+        lastBored=now;lastPulse=now;
     }
-
-    // -------------------------------------------------------------------------
-    // Dome command processing
-    // -------------------------------------------------------------------------
-
-    processDomeCmd(
-        previousDomeCmd,
-        boredCount,
-        lastBored,
-        lastPulse);
-
-    // -------------------------------------------------------------------------
-    // Current display state
-    // -------------------------------------------------------------------------
-
-    bool display =
-        getDisplayMode();
-
-    // -------------------------------------------------------------------------
-    // Eye pulse
-    // -------------------------------------------------------------------------
-
-    if (display &&
-        domeState == DOME_IDLE &&
-        now - lastPulse >=
-            PULSE_INTERVAL_MS) {
-
-        startPulse();
-
-        lastPulse = now;
-    }
-
-    // -------------------------------------------------------------------------
-    // Bored timer
-    // -------------------------------------------------------------------------
-
-    if (display &&
-        domeState == DOME_IDLE &&
-        now - lastBored >=
-            BORED_INTERVAL_MS) {
-
-        DBGLN(
-            "[DOME] Bored");
-
-        int boredVolume =
-            getVolume();
-
-        if (getDFPlayerAvailable()) {
-
-            mp3.volume(
-                boredVolume);
-        }
-
-        if (boredCount <
-            BORED_COUNT_MAX) {
-
-            playSound(
-                SND_MOAN);
-
-            boredCount++;
-
-        } else {
-
-            DBGLN(
-                "[DOME] Really bored");
-
-            playSound(
-                SND_REALLY_BORED);
-
-            paletteIdx = 0;
-
-            paletteRound = 0;
-
-            domeState =
-                DOME_BORED_PALETTE;
-
-            boredCount = 0;
-        }
-
-        lastBored = now;
-
-        lastPulse = now;
-    }
-
-    // -------------------------------------------------------------------------
-    // Yield
-    // -------------------------------------------------------------------------
-
     delay(1);
 }
+
