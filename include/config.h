@@ -71,8 +71,8 @@
 #define INVERT_RIGHT_MOTOR  false
 
 // -- DFPlayer Mini (hardware UART2) ----------------------------
-#define PIN_DFPLAYER_RX     16
-#define PIN_DFPLAYER_TX     17
+#define PIN_DFPLAYER_RX     17
+#define PIN_DFPLAYER_TX     16
 
 // -- FastLED WS2811 eyestalk ----------------------------------
 #define PIN_LED_DATA         4
