@@ -3,11 +3,22 @@
 // =============================================================
 //  config.h  -  Dalek ESP32 unified firmware
 //  Edit pin assignments, thresholds and motor flags here.
-//  WiFi credentials live in secrets.ini (never commit that file).
+//  WiFi credentials AND API token live in secrets.ini
+//  (never commit that file).
 // =============================================================
 
-// -- Debug output (comment out to disable) ---------------------
-#define DEBUG
+// =============================================================
+//  DEBUG
+//  Comment out the #define to disable all serial output.
+//  When disabled: no Serial.begin(), zero runtime overhead,
+//  and the serial monitor will show nothing.
+//
+//  TIP: for production builds leave this commented out, or
+//  set it via secrets.ini:
+//    build_flags = ... -DDEBUG
+// =============================================================
+// #define DEBUG
+
 #ifdef DEBUG
   #define DBG(x)   Serial.print(x)
   #define DBGLN(x) Serial.println(x)
@@ -17,13 +28,41 @@
 #endif
 
 // =============================================================
-//  PIN ASSIGNMENTS  (ESP32 DevKit v1 - 30 or 38 pin)
-//  Avoid: 6-11 (flash), 34-39 are input-only (no pull-up/drive)
+//  SECURITY
+//  API_TOKEN is injected via secrets.ini as a build flag:
+//    -DAPI_TOKEN=\"your_secret_token_here\"
+//  Every HTTP request must include the header:
+//    X-Token: <your_secret_token_here>
+//  The web UI sends it automatically.
+//  If not set in secrets.ini this fallback is used — change it!
+// =============================================================
+#ifndef API_TOKEN
+  #define API_TOKEN "change_me_dalek_token"
+#endif
+
+// OTA password hash (MD5 of your password).
+// Generate with: echo -n "your_password" | md5sum
+// Inject via secrets.ini:
+//   -DOTA_PASSWORD_HASH=\"your_md5_hash\"
+#ifndef OTA_PASSWORD_HASH
+  #define OTA_PASSWORD_HASH "d41d8cd98f00b204e9800998ecf8427e"
+#endif
+
+// =============================================================
+//  PIN ASSIGNMENTS  (ESP32 DevKitC V4 - WROOM-32U, 38 pin)
+//
+//  AVOID:
+//    6-11   internal flash - never use
+//    34-39  input-only (no pull-up/drive) - read only
+//    0,2,12,15  strapping pins - avoid driving at boot
 // =============================================================
 
 // -- Ultrasonic sensors (Maxbotix EZ1, PWM output) ------------
+//    GPIO 32 is a safe unrestricted output pin.
 //    Pins 34-36 are input-only - fine for pulseIn reads.
-#define PIN_SONIC_TRIGGER   15   // common trigger -> all three sensors RX
+//    Add 10k pull-down resistors on pins 34/35/36 in hardware
+//    to prevent floating inputs when sensors are disconnected.
+#define PIN_SONIC_TRIGGER   32   // common trigger -> all three sensors RX
 #define PIN_SONIC_RIGHT     34   // PWM output of right sensor
 #define PIN_SONIC_CENTER    35   // PWM output of center sensor
 #define PIN_SONIC_LEFT      36   // PWM output of left sensor
@@ -84,10 +123,12 @@
 // =============================================================
 //  SOUND / LED
 // =============================================================
-#define DEFAULT_VOLUME      30          // 0-30
-#define BORED_INTERVAL_MS   900000UL    // 15 minutes
-#define PULSE_INTERVAL_MS    10000UL    // eyestalk pulse period
-#define BOOT_DELAY_MS        15000UL    // startup animation duration
+#define DEFAULT_VOLUME        25          // 0-30 (was 30; slightly less aggressive)
+#define SND_EXTERMINATE_VOLUME 30         // full volume for exterminate only
+#define BORED_COUNT_MAX         3         // moans before "really bored" palette
+#define BORED_INTERVAL_MS  900000UL       // 15 minutes between bored events
+#define PULSE_INTERVAL_MS   10000UL       // eyestalk pulse period
+#define BOOT_DELAY_MS        3000UL       // startup animation duration
 
 // Sound folder / track numbers (match your SD card layout)
 #define SND_FOLDER          10
