@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================
-//  config.h - Dalek ESP32 unified firmware
+//  config.h - Dalek ESP32 unified firmware - V0.53
 //
 //  Edit pin assignments, thresholds and motor flags here.
 //
@@ -41,18 +41,24 @@
 // =============================================================
 
 // -- Ultrasonic sensors (Maxbotix EZ1, PWM output) ------------
-//    GPIO32 = common trigger -> all three sensors RX
-//    GPIO34 = right sensor PWM input
-//    GPIO35 = center sensor PWM input
-//    GPIO33 = left sensor PWM input
+//    GPIO32 = external trigger -> RX of FIRST sensor (right)
+//    TX right -> RX center -> TX center -> RX left
+//    GPIO34 = right sensor PW output
+//    GPIO35 = center sensor PW output
+//    GPIO33 = left sensor PW output
 //
-//    Add 10k pulldown resistors on GPIO34/35/33 to prevent
-//    floating inputs when sensors are disconnected.
+//    Sensors are powered from 5V. Their PW outputs can therefore
+//    reach 5V and MUST NOT be connected directly to the ESP32.
+//    Use one voltage divider per PW signal, e.g. 10k from PW to
+//    the GPIO and 20k from GPIO to GND (~3.33V at the ESP32 pin).
+//
+//    Optional 10k pulldown resistors are not needed when the
+//    voltage-divider resistors are installed as shown above.
 
-#define PIN_SONIC_TRIGGER   32
-#define PIN_SONIC_RIGHT     34
-#define PIN_SONIC_CENTER    35
-#define PIN_SONIC_LEFT      33
+#define PIN_SONIC_TRIGGER   32   // external trigger -> RX of FIRST sensor (right)
+#define PIN_SONIC_RIGHT     34   // PWM output of right sensor
+#define PIN_SONIC_CENTER    35   // PWM output of center sensor
+#define PIN_SONIC_LEFT      33   // PWM output of left sensor
 
 // -- Stepper motors (Big Easy Driver: STEP + DIR) -------------
 #define PIN_LEFT_STEP       25

@@ -18,10 +18,9 @@
 //    2. Non-blocking dome events  - doStayAway / doExterminate /
 //       doBored use millis() state machines instead of delay(),
 //       so the web server stays responsive during sound/light events.
-//    3. Sensor reads moved to a short sub-task window  - pulseIn
-//       calls are still sequential (hardware constraint of the
-//       daisy-chain) but happen in a timed 500 ms slot so the
-//       stepper task loop is free the rest of the time.
+//    3. Sensor PWM capture via interrupts - all three Maxbotix PW
+//       outputs are measured concurrently after one shared trigger,
+//       so one sensor cannot make another pulse get missed.
 //    4. WiFi credentials in secrets.ini  - never in source code.
 //    5. Motor direction invert flags  - configurable in config.h
 //       without rewiring.
@@ -38,7 +37,7 @@
 #include "esp_system.h"
 #include "config.h"
 
-static constexpr const char* FIRMWARE_VERSION = "V0.52";
+static constexpr const char* FIRMWARE_VERSION = "V0.53";
 
 // V0.52 WiFi/OTA state
 static bool otaStarted = false;
@@ -87,6 +86,12 @@ FastAccelStepper* rightStepper = nullptr;
 DFRobotDFPlayerMini mp3;
 volatile bool dfplayerAvailable = false;
 
+// Current DFPlayer playback state for the web interface.
+static volatile bool mp3Playing = false;
+static volatile int mp3CurrentTrack = 0;
+static volatile int mp3LastEventType = -1;
+static volatile int mp3LastEventValue = 0;
+
 // FastLED
 CRGB leds[NUM_LEDS];
 
@@ -122,8 +127,11 @@ void setDomeCmd(int cmd) {
 //
 //  FastAccelStepper generates step pulses via the RMT peripheral
 //  in the background, so this task only needs to call move/stop
-//  when the command changes.  Sensor reads happen every 500 ms;
-//  the rest of the time the task yields immediately.
+//  when the command changes. Sensor reads use the MaxBotix
+//  sequential RX->TX chain: one trigger starts the right sensor,
+//  then its TX output triggers center, and center TX triggers left.
+//  The three PW pulse widths are captured by interrupts while the
+//  sequence completes.
 // =============================================================
 
 struct SensorFilter {
@@ -135,6 +143,51 @@ struct SensorFilter {
 
 static SensorFilter filterRight, filterCenter, filterLeft;
 
+// Maxbotix LV-MaxSonar-EZ1 PWM output: 147 microseconds per inch.
+static constexpr float SONIC_US_PER_INCH = 147.0f;
+static constexpr float SONIC_CM_PER_US   = 2.54f / SONIC_US_PER_INCH;
+
+// Interrupt-captured pulse widths for the three Maxbotix PWM outputs.
+static volatile uint32_t sensorStartRight = 0;
+static volatile uint32_t sensorStartCenter = 0;
+static volatile uint32_t sensorStartLeft = 0;
+static volatile uint32_t sensorPulseRight = 0;
+static volatile uint32_t sensorPulseCenter = 0;
+static volatile uint32_t sensorPulseLeft = 0;
+static volatile bool sensorPulseReadyRight = false;
+static volatile bool sensorPulseReadyCenter = false;
+static volatile bool sensorPulseReadyLeft = false;
+
+static void IRAM_ATTR sensorRightISR() {
+    uint32_t now = micros();
+    if (digitalRead(PIN_SONIC_RIGHT)) {
+        sensorStartRight = now;
+    } else if (sensorStartRight != 0) {
+        sensorPulseRight = now - sensorStartRight;
+        sensorPulseReadyRight = true;
+    }
+}
+
+static void IRAM_ATTR sensorCenterISR() {
+    uint32_t now = micros();
+    if (digitalRead(PIN_SONIC_CENTER)) {
+        sensorStartCenter = now;
+    } else if (sensorStartCenter != 0) {
+        sensorPulseCenter = now - sensorStartCenter;
+        sensorPulseReadyCenter = true;
+    }
+}
+
+static void IRAM_ATTR sensorLeftISR() {
+    uint32_t now = micros();
+    if (digitalRead(PIN_SONIC_LEFT)) {
+        sensorStartLeft = now;
+    } else if (sensorStartLeft != 0) {
+        sensorPulseLeft = now - sensorStartLeft;
+        sensorPulseReadyLeft = true;
+    }
+}
+
 static long median3(long a, long b, long c) {
     if (a > b) { long t=a; a=b; b=t; }
     if (b > c) { long t=b; b=c; c=t; }
@@ -142,38 +195,129 @@ static long median3(long a, long b, long c) {
     return b;
 }
 
-static long filterSensor(SensorFilter& f, long pulse) {
-    if (pulse <= 0) return f.lastValid;
-    long cm = pulse / 58;
+static long filterSensor(SensorFilter& f, uint32_t pulseUs) {
+    // No valid pulse: retain the last valid distance.
+    if (pulseUs == 0) return f.lastValid;
+
+    long cm = lroundf((float)pulseUs * SONIC_CM_PER_US);
     if (cm < 1) cm = 1;
     if (cm > SONIC_MAX_CM) cm = SONIC_MAX_CM;
+
     f.lastValid = cm;
     f.samples[f.index] = cm;
     f.index = (f.index + 1) % 3;
     if (f.count < 3) f.count++;
+
     if (f.count == 1) return f.samples[0];
     if (f.count == 2) return (f.samples[0] + f.samples[1]) / 2;
     return median3(f.samples[0], f.samples[1], f.samples[2]);
 }
 
-void readSensors() {
+// Non-blocking MaxBotix sequential-chain sensor state machine.
+// One external trigger starts the right sensor; TX->RX then cascades
+// to center and left. ISRs capture the PW pulse from each sensor.
+struct SensorSequence {
+    bool active = false;
+    unsigned long startedAt = 0;
+};
+
+static SensorSequence sensorSequence;
+static unsigned long lastSensorSequence = 0;
+
+// Forward declaration for the sensor sequence completion handler.
+void sensorAction();
+static constexpr unsigned long SENSOR_SEQUENCE_PERIOD_MS = 250UL;
+static constexpr unsigned long SENSOR_SEQUENCE_TIMEOUT_MS = 220UL;
+
+static void resetSensorCapture() {
+    portENTER_CRITICAL(&cmdMux);
+    sensorStartRight = 0;
+    sensorStartCenter = 0;
+    sensorStartLeft = 0;
+    sensorPulseRight = 0;
+    sensorPulseCenter = 0;
+    sensorPulseLeft = 0;
+    sensorPulseReadyRight = false;
+    sensorPulseReadyCenter = false;
+    sensorPulseReadyLeft = false;
+    portEXIT_CRITICAL(&cmdMux);
+}
+
+static void startSensorSequence() {
+    resetSensorCapture();
+
     digitalWrite(PIN_SONIC_TRIGGER, HIGH);
     delayMicroseconds(25);
     digitalWrite(PIN_SONIC_TRIGGER, LOW);
 
-    long rp = pulseIn(PIN_SONIC_RIGHT,  HIGH, SONIC_PULSE_TIMEOUT_US);
-    long cp = pulseIn(PIN_SONIC_CENTER, HIGH, SONIC_PULSE_TIMEOUT_US);
-    long lp = pulseIn(PIN_SONIC_LEFT,   HIGH, SONIC_PULSE_TIMEOUT_US);
+    sensorSequence.active = true;
+    sensorSequence.startedAt = millis();
+}
 
-    long r = filterSensor(filterRight, rp);
-    long c = filterSensor(filterCenter, cp);
-    long l = filterSensor(filterLeft, lp);
+static void finishSensorSequence() {
+    uint32_t rp = 0, cp = 0, lp = 0;
+    bool rr = false, cr = false, lr = false;
+
+    portENTER_CRITICAL(&cmdMux);
+    rp = sensorPulseRight;
+    cp = sensorPulseCenter;
+    lp = sensorPulseLeft;
+    rr = sensorPulseReadyRight;
+    cr = sensorPulseReadyCenter;
+    lr = sensorPulseReadyLeft;
+    portEXIT_CRITICAL(&cmdMux);
+
+    long r = filterSensor(filterRight, rr ? rp : 0);
+    long c = filterSensor(filterCenter, cr ? cp : 0);
+    long l = filterSensor(filterLeft, lr ? lp : 0);
 
     portENTER_CRITICAL(&cmdMux);
     rightCM = r;
     centerCM = c;
     leftCM = l;
     portEXIT_CRITICAL(&cmdMux);
+
+    static unsigned long lastSensorLog = 0;
+    if (millis() - lastSensorLog >= 5000UL) {
+        lastSensorLog = millis();
+        DBG("[US] R="); DBG(r); DBG(" C="); DBG(c); DBG(" L=");
+        DBG(l);
+        if (!rr || !cr || !lr) {
+            DBG(" | miss:");
+            if (!rr) DBG(" R");
+            if (!cr) DBG(" C");
+            if (!lr) DBG(" L");
+        }
+        DBGLN("");
+    }
+
+    sensorAction();
+    sensorSequence.active = false;
+    lastSensorSequence = millis();
+}
+
+static void updateSensorSequence() {
+    const unsigned long now = millis();
+
+    if (!sensorSequence.active) {
+        if (now - lastSensorSequence >= SENSOR_SEQUENCE_PERIOD_MS) {
+            startSensorSequence();
+        }
+        return;
+    }
+
+    bool rr, cr, lr;
+    portENTER_CRITICAL(&cmdMux);
+    rr = sensorPulseReadyRight;
+    cr = sensorPulseReadyCenter;
+    lr = sensorPulseReadyLeft;
+    portEXIT_CRITICAL(&cmdMux);
+
+    // Finish as soon as all three have arrived, or after the timeout so
+    // one failed sensor can never stall the navigation loop.
+    if ((rr && cr && lr) || (now - sensorSequence.startedAt >= SENSOR_SEQUENCE_TIMEOUT_MS)) {
+        finishSensorSequence();
+    }
 }
 
 // Sticky blocked/clear state with hysteresis: a side becomes "blocked" at
@@ -311,31 +455,23 @@ void motorTask(void* pvParameters) {
         rightStepper->setSpeedInHz(MOTOR_MAX_SPEED);
     }
 
-    static unsigned long lastSensorRead = 0;
+    bool wasRunning = false;
 
     for (;;) {
-        unsigned long now = millis();
-
-        if (now - lastSensorRead >= 500) {
-            readSensors();
-            sensorAction();
-            lastSensorRead = now;
-        }
+        updateSensorSequence();
 
         bool mr;
         portENTER_CRITICAL(&cmdMux);
         mr = motorRunning;
         portEXIT_CRITICAL(&cmdMux);
         if (mr) {
-            applyMotorCmd();
-        } else {
-            // Ensure stopped when movement is disabled
-            if (leftStepper  && leftStepper->isRunning())  leftStepper->stopMove();
-            if (rightStepper && rightStepper->isRunning()) rightStepper->stopMove();
-            // Force the stop command into the driver after movement was disabled.
+            applyMotorCmd(wasRunning == false);
+        } else if (wasRunning) {
+            // Only issue the stop command on the running -> stopped transition.
             setMotorCmd(2);
             applyMotorCmd(true);
         }
+        wasRunning = mr;
 
         esp_task_wdt_reset();
 
@@ -493,7 +629,74 @@ void playSound(int track) {
     se = soundEnabled;
     available = dfplayerAvailable;
     portEXIT_CRITICAL(&cmdMux);
-    if (se && available) mp3.playFolder(SND_FOLDER, track);
+
+    if (!se || !available) return;
+    if (track < 1 || track > 255) return;
+
+    mp3.playFolder(SND_FOLDER, track);
+
+    portENTER_CRITICAL(&cmdMux);
+    mp3Playing = true;
+    mp3CurrentTrack = track;
+    mp3LastEventType = -1;
+    mp3LastEventValue = 0;
+    portEXIT_CRITICAL(&cmdMux);
+
+    DBG("[MP3] play folder "); DBG(SND_FOLDER);
+    DBG(" track "); DBGLN(track);
+}
+
+void stopSound() {
+    bool available;
+    portENTER_CRITICAL(&cmdMux);
+    available = dfplayerAvailable;
+    portEXIT_CRITICAL(&cmdMux);
+
+    if (!available) return;
+
+    mp3.stop();
+
+    portENTER_CRITICAL(&cmdMux);
+    mp3Playing = false;
+    mp3CurrentTrack = 0;
+    portEXIT_CRITICAL(&cmdMux);
+
+    DBGLN("[MP3] stop");
+}
+
+void processDFPlayerEvents() {
+    bool available;
+    portENTER_CRITICAL(&cmdMux);
+    available = dfplayerAvailable;
+    portEXIT_CRITICAL(&cmdMux);
+
+    if (!available) return;
+
+    while (mp3.available()) {
+        uint8_t type = mp3.readType();
+        int value = mp3.read();
+
+        portENTER_CRITICAL(&cmdMux);
+        mp3LastEventType = type;
+        mp3LastEventValue = value;
+        portEXIT_CRITICAL(&cmdMux);
+
+        if (type == DFPlayerPlayFinished) {
+            portENTER_CRITICAL(&cmdMux);
+            mp3Playing = false;
+            mp3CurrentTrack = 0;
+            portEXIT_CRITICAL(&cmdMux);
+
+            DBG("[MP3] finished track "); DBGLN(value);
+        } else if (type == DFPlayerError) {
+            portENTER_CRITICAL(&cmdMux);
+            mp3Playing = false;
+            mp3CurrentTrack = 0;
+            portEXIT_CRITICAL(&cmdMux);
+
+            DBG("[MP3] error code "); DBGLN(value);
+        }
+    }
 }
 
 // =============================================================
@@ -705,6 +908,21 @@ button:disabled{opacity:.45;cursor:not-allowed;transform:none}
 #connection.ok{color:var(--on)}
 #connection.down{color:var(--off)}
 #notice{min-height:22px;margin:12px 0;color:var(--muted);font-size:14px}
+.mp3-now{font-family:'Orbitron',monospace;font-size:21px;color:var(--on);margin-bottom:5px}
+.mp3-meta{color:var(--muted);font-size:14px;margin-bottom:12px}
+.mp3-controls{display:grid;grid-template-columns:110px 1fr 1fr;gap:8px}
+.mp3-controls input{width:100%;border:1px solid var(--line);border-radius:9px;background:#08120e;color:var(--text);font-family:'Orbitron',monospace;font-size:20px;text-align:center;padding:8px}
+.mp3-controls button{margin:0}
+.play-btn{border-color:var(--on)!important}
+.stop-btn{border-color:var(--off)!important}
+.media-icon{display:inline-block;vertical-align:-2px;margin-right:9px;position:relative;width:0;height:0}
+.media-play{border-top:9px solid transparent;border-bottom:9px solid transparent;border-left:14px solid currentColor}
+.media-stop{width:15px;height:15px;border-radius:2px;background:currentColor;vertical-align:-2px}
+.quick-title{margin-top:14px;color:var(--muted);font-size:12px;letter-spacing:2px}
+.quick-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.quick-grid button{font-size:12px;margin-top:8px;padding:10px 6px}
+.quick-grid button span{color:var(--muted);font-size:11px}
+@media(max-width:700px){.mp3-controls{grid-template-columns:90px 1fr 1fr}.quick-grid{grid-template-columns:1fr 1fr}}
 .footer{text-align:center;color:#537562;font-size:12px;margin:15px 0 5px}
 </style>
 </head>
@@ -769,6 +987,24 @@ button:disabled{opacity:.45;cursor:not-allowed;transform:none}
   </div>
 
   <div class="card" style="margin-top:14px">
+    <h2>GELUIDSPLAYER</h2>
+    <div class="mp3-now" id="mp3Now">GEEN GELUID</div>
+    <div class="mp3-meta" id="mp3Meta">DFPlayer: ---</div>
+    <div class="mp3-controls">
+      <input id="trackInput" type="number" min="1" max="255" value="1" aria-label="MP3 track">
+      <button class="play-btn" onclick="playTrack()"><span class="media-icon media-play" aria-hidden="true"></span>AFSPELEN</button>
+      <button class="stop-btn" onclick="cmd('/sound/stop')"><span class="media-icon media-stop" aria-hidden="true"></span>STOP</button>
+    </div>
+    <div class="quick-title">SNELKEUZE</div>
+    <div class="quick-grid">
+      <button onclick="playTrack(1)">EXTERMINATE<br><span>001</span></button>
+      <button onclick="playTrack(3)">MOAN<br><span>003</span></button>
+      <button onclick="playTrack(4)">STAY AWAY<br><span>004</span></button>
+      <button onclick="playTrack(10)">REALLY BORED<br><span>010</span></button>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
     <h2>SYSTEEM</h2>
     <div class="info">
       <div class="info-row"><span class="label">IP</span><span id="ip">---</span></div>
@@ -829,12 +1065,23 @@ function sensor(id, stateId, value){
 async function cmd(u){
   try{
     const r=await fetch(u,{headers:{'X-Token':token},cache:'no-store'});
-    if(!r.ok) throw new Error('HTTP '+r.status);
+    if(!r.ok) throw new Error((await r.text())||('HTTP '+r.status));
     document.getElementById('notice').textContent='Commando uitgevoerd';
     await poll();
   }catch(e){
     document.getElementById('notice').textContent='Commando mislukt: '+e.message;
   }
+}
+
+async function playTrack(track){
+  const input=document.getElementById('trackInput');
+  if(track===undefined) track=Number(input.value);
+  if(!Number.isInteger(track) || track<1 || track>255){
+    document.getElementById('notice').textContent='Track moet 1-255 zijn';
+    return;
+  }
+  input.value=track;
+  await cmd('/sound/play?track='+encodeURIComponent(track));
 }
 
 async function poll(){
@@ -860,6 +1107,15 @@ async function poll(){
     document.getElementById('rssi').textContent=d.wifi?d.rssi+' dBm':'---';
     document.getElementById('channel').textContent=d.wifi?d.channel:'---';
     document.getElementById('dfplayer').textContent=d.dfplayer?'OK':'NIET GEVONDEN';
+    const mp3Now=document.getElementById('mp3Now');
+    const mp3Meta=document.getElementById('mp3Meta');
+    if(d.playing){
+      mp3Now.textContent='SPEELT: MAP 10 / TRACK '+String(d.track).padStart(3,'0');
+      mp3Meta.textContent=d.dfplayer?'DFPlayer: AFSPELEN':'DFPlayer: NIET GEVONDEN';
+    }else{
+      mp3Now.textContent='GEEN GELUID';
+      mp3Meta.textContent=d.dfplayer?'DFPlayer: KLAAR':'DFPlayer: NIET GEVONDEN';
+    }
     document.getElementById('uptime').textContent=Math.floor(d.uptime/60)+' min '+(d.uptime%60)+' s';
 
     const conn=document.getElementById('connection');
@@ -887,20 +1143,22 @@ void handleRoot() {
 }
 
 void handleStatus() {
-    bool dm,mr,se,df;
-    int vol;
+    bool dm,mr,se,df,playing;
+    int vol,track;
     long r,c,l;
     portENTER_CRITICAL(&cmdMux);
     dm=displayMode; mr=motorRunning; se=soundEnabled; vol=volume;
     r=rightCM; c=centerCM; l=leftCM; df=dfplayerAvailable;
+    playing=mp3Playing; track=mp3CurrentTrack;
     portEXIT_CRITICAL(&cmdMux);
     char json[512];
     bool wifi = (WiFi.status() == WL_CONNECTED);
     String ip = wifi ? WiFi.localIP().toString() : String();
     snprintf(json,sizeof(json),
-        "{\"version\":\"%s\",\"display\":%s,\"motors\":%s,\"sound\":%s,\"dfplayer\":%s,\"volume\":%d,\"right\":%ld,\"center\":%ld,\"left\":%ld,\"wifi\":%s,\"ip\":\"%s\",\"rssi\":%d,\"channel\":%d,\"uptime\":%lu}",
+        "{\"version\":\"%s\",\"display\":%s,\"motors\":%s,\"sound\":%s,\"dfplayer\":%s,\"playing\":%s,\"track\":%d,\"volume\":%d,\"right\":%ld,\"center\":%ld,\"left\":%ld,\"wifi\":%s,\"ip\":\"%s\",\"rssi\":%d,\"channel\":%d,\"uptime\":%lu}",
         FIRMWARE_VERSION,dm?"true":"false",mr?"true":"false",se?"true":"false",df?"true":"false",
-        vol,r,c,l,wifi?"true":"false",ip.c_str(),wifi?(int)WiFi.RSSI():0,wifi?(int)WiFi.channel():0,millis()/1000UL);
+        playing?"true":"false",track,vol,r,c,l,wifi?"true":"false",ip.c_str(),
+        wifi?(int)WiFi.RSSI():0,wifi?(int)WiFi.channel():0,millis()/1000UL);
     server.send(200,"application/json",json);
 }
 
@@ -926,24 +1184,62 @@ void setupWebRoutes() {
         if(!checkToken()) return;
         bool mr; portENTER_CRITICAL(&cmdMux); mr=motorRunning; portEXIT_CRITICAL(&cmdMux);
         portENTER_CRITICAL(&cmdMux); motorRunning=!mr; portEXIT_CRITICAL(&cmdMux);
-        if(mr) setMotorCmd(2); else setDomeCmd(19);
+        if(mr) setMotorCmd(2);
         server.send(200,"text/plain","ok");
     });
     server.on("/movement/on", [](){
         if(!checkToken()) return;
         portENTER_CRITICAL(&cmdMux); motorRunning=true; portEXIT_CRITICAL(&cmdMux);
-        setDomeCmd(19); server.send(200,"text/plain","ok");
+        server.send(200,"text/plain","ok");
     });
     server.on("/movement/off", [](){
         if(!checkToken()) return;
         portENTER_CRITICAL(&cmdMux); motorRunning=false; portEXIT_CRITICAL(&cmdMux);
-        setMotorCmd(2); setDomeCmd(18); server.send(200,"text/plain","ok");
+        setMotorCmd(2); server.send(200,"text/plain","ok");
     });
     server.on("/sound/toggle", [](){
         if(!checkToken()) return;
         bool se; portENTER_CRITICAL(&cmdMux); se=soundEnabled; portEXIT_CRITICAL(&cmdMux);
         portENTER_CRITICAL(&cmdMux); soundEnabled=!se; portEXIT_CRITICAL(&cmdMux);
         setDomeCmd(se?14:15); server.send(200,"text/plain","ok");
+    });
+    server.on("/sound/play", [](){
+        if(!checkToken()) return;
+
+        if (!server.hasArg("track")) {
+            server.send(400,"text/plain","Track ontbreekt");
+            return;
+        }
+
+        int track = server.arg("track").toInt();
+        if (track < 1 || track > 255) {
+            server.send(400,"text/plain","Track moet 1-255 zijn");
+            return;
+        }
+
+        bool se, available;
+        portENTER_CRITICAL(&cmdMux);
+        se = soundEnabled;
+        available = dfplayerAvailable;
+        portEXIT_CRITICAL(&cmdMux);
+
+        if (!available) {
+            server.send(503,"text/plain","DFPlayer niet beschikbaar");
+            return;
+        }
+        if (!se) {
+            server.send(409,"text/plain","Geluid staat UIT");
+            return;
+        }
+
+        playSound(track);
+        server.send(200,"text/plain","ok");
+    });
+
+    server.on("/sound/stop", [](){
+        if(!checkToken()) return;
+        stopSound();
+        server.send(200,"text/plain","ok");
     });
     server.on("/volume/up", [](){if(!checkToken())return;setDomeCmd(16);server.send(200,"text/plain","ok");});
     server.on("/volume/down", [](){if(!checkToken())return;setDomeCmd(17);server.send(200,"text/plain","ok");});
@@ -994,6 +1290,11 @@ void setup() {
     pinMode(PIN_SONIC_CENTER,INPUT);
     pinMode(PIN_SONIC_LEFT,INPUT);
 
+    attachInterrupt(digitalPinToInterrupt(PIN_SONIC_RIGHT), sensorRightISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_SONIC_CENTER), sensorCenterISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_SONIC_LEFT),  sensorLeftISR,  CHANGE);
+    DBGLN("Ultrasonic sequential-chain interrupts attached");
+
     domeStateStart=millis(); domeState=DOME_BOOT;
     DBGLN("Boot animation started");
     while(updateDomeFSM()) { yield(); }
@@ -1037,7 +1338,8 @@ void setup() {
 // =============================================================
 void loop() {
     server.handleClient();
-    ArduinoOTA.handle();
+    processDFPlayerEvents();
+    if (otaStarted) ArduinoOTA.handle();
     esp_task_wdt_reset();
 
     static int prevDomeCmd=-1;
