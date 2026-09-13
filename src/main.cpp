@@ -255,7 +255,7 @@ void applyMotorCmd(bool force = false) {
     portEXIT_CRITICAL(&cmdMux);
 
     if (!leftStepper || !rightStepper) return;
-    if (cmd == prevAppliedCmd) return;
+    if (!force && cmd == prevAppliedCmd) return;
     prevAppliedCmd = cmd;
 
     switch (cmd) {
@@ -607,27 +607,281 @@ bool checkToken() {
     return false;
 }
 
-void handleRoot() {
-    const char html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DALEK COMMAND</title><style>
-body{background:#050a07;color:#c8ffe8;font-family:monospace;text-align:center;margin:20px}
-button{font-size:22px;padding:14px;margin:5px;min-width:150px;background:#0a1410;color:#c8ffe8;border:1px solid #1a3a28}
-.on{border-color:#00ff88}.off{border-color:#ff2200}.sensor{font-size:24px;margin:10px}
-</style></head><body><h1>!! EXTERMINATE !!</h1>
-<div class="sensor">R: <span id="r">---</span> cm | C: <span id="c">---</span> cm | L: <span id="l">---</span> cm</div>
-<div><button onclick="cmd('/display/toggle')">DISPLAY</button><button onclick="cmd('/movement/toggle')">MOTOREN</button></div>
-<div><button onclick="cmd('/sound/toggle')">GELUID</button></div>
-<div><button onclick="cmd('/volume/down')">− VOLUME</button><span id="v">--</span><button onclick="cmd('/volume/up')">+ VOLUME</button></div>
-<p id="status">LIVE</p><script>
+// Main web interface stored in flash, not on the loopTask stack.
+static const char WEB_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DALEK COMMAND</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;600;700;800&family=Rajdhani:wght@500;600;700&display=swap');
+:root{
+  --bg:#050a07;
+  --panel:#0a1410;
+  --panel2:#0e1c16;
+  --text:#c8ffe8;
+  --muted:#72a890;
+  --line:#214332;
+  --on:#00ff88;
+  --off:#ff3344;
+  --warn:#ffc857;
+  --blue:#4da6ff;
+}
+*{box-sizing:border-box}
+body{
+  background:radial-gradient(circle at top,#102018 0,#050a07 55%);
+  color:var(--text);
+  font-family:monospace;
+  margin:0;
+  padding:18px;
+}
+.wrap{max-width:900px;margin:0 auto}
+h1{margin:6px 0 2px;font-family:'Orbitron','Rajdhani','Arial Narrow',sans-serif;font-size:34px;font-weight:800;letter-spacing:5px;text-align:center;text-transform:uppercase;text-shadow:0 0 10px rgba(0,255,136,.22)}
+.subtitle{color:var(--muted);margin-bottom:18px;text-align:center;font-family:'Rajdhani','Arial Narrow',sans-serif;font-size:16px;letter-spacing:2px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}.sensor-grid{grid-template-columns:1fr!important}}
+.card{
+  background:rgba(10,20,16,.94);
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:14px;
+  box-shadow:0 0 20px rgba(0,0,0,.25);
+}
+.card h2{font-size:15px;margin:0 0 10px;color:var(--muted);font-weight:normal}
+.state{
+  font-size:24px;
+  font-weight:bold;
+  margin-bottom:10px;
+  text-shadow:0 0 8px currentColor;
+}
+.state.on{color:var(--on)}
+.state.off{color:var(--off)}
+button{
+  width:100%;
+  border:1px solid var(--line);
+  border-radius:9px;
+  padding:12px 10px;
+  margin-top:8px;
+  background:#0b1712;
+  color:var(--text);
+  font-family:'Rajdhani','Arial Narrow',sans-serif;
+  font-weight:600;
+  font-size:18px;
+  letter-spacing:1px;
+  cursor:pointer;
+  transition:.15s ease;
+}
+button:hover{filter:brightness(1.25);transform:translateY(-1px)}
+button.active{border-color:var(--on);background:#06351f;color:#fff;box-shadow:0 0 12px rgba(0,255,136,.18)}
+button.inactive{border-color:var(--off);background:#351016;color:#fff;box-shadow:0 0 12px rgba(255,51,68,.12)}
+button:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.sensor-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.sensor{text-align:center;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px}
+.sensor .name{color:var(--muted);font-size:14px}
+.sensor .dist{font-size:29px;font-weight:bold;margin:5px 0}
+.sensor .dist.clear{color:var(--on)}
+.sensor .dist.warn{color:var(--warn)}
+.sensor .dist.blocked{color:var(--off)}
+.sensor .state{font-size:13px;margin:0;text-shadow:none}
+.sensor .state.clear{color:var(--on)}
+.sensor .state.warn{color:var(--warn)}
+.sensor .state.blocked{color:var(--off)}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:700px){.controls{grid-template-columns:1fr}}
+.volume{display:flex;align-items:center;justify-content:center;gap:10px}
+.volume button{width:58px;min-width:58px;height:48px;margin:0;display:flex;align-items:center;justify-content:center;font-family:Arial,sans-serif;font-size:30px;font-weight:400;line-height:1;padding:0}
+.volume-symbol{position:relative;display:block;width:20px;height:20px}
+.volume-minus::before{content:'';position:absolute;left:0;right:0;top:8px;height:3px;background:currentColor;border-radius:2px}
+.volume-plus::before,.volume-plus::after{content:'';position:absolute;background:currentColor;border-radius:2px}
+.volume-plus::before{left:0;right:0;top:8px;height:3px}
+.volume-plus::after{top:0;bottom:0;left:8px;width:3px}
+.volume-value{min-width:56px;text-align:center;font-family:'Orbitron',monospace;font-size:24px;font-weight:600}
+.info{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;font-size:14px}
+@media(max-width:700px){.info{grid-template-columns:1fr}}
+.info-row{display:flex;justify-content:space-between;border-bottom:1px solid #163124;padding:6px 0}
+.label{color:var(--muted)}
+#connection{font-weight:bold}
+#connection.ok{color:var(--on)}
+#connection.down{color:var(--off)}
+#notice{min-height:22px;margin:12px 0;color:var(--muted);font-size:14px}
+.footer{text-align:center;color:#537562;font-size:12px;margin:15px 0 5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>!! EXTERMINATE !!</h1>
+  <div class="subtitle">DALEK COMMAND &nbsp;|&nbsp; <span id="version">---</span></div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>DISPLAY</h2>
+      <div id="displayState" class="state off">UIT</div>
+      <button id="displayBtn" onclick="cmd('/display/toggle')">DISPLAY</button>
+    </div>
+    <div class="card">
+      <h2>MOTOREN</h2>
+      <div id="motorState" class="state off">GESTOPT</div>
+      <button id="motorBtn" onclick="cmd('/movement/toggle')">MOTOREN</button>
+    </div>
+    <div class="card">
+      <h2>GELUID</h2>
+      <div id="soundState" class="state off">UIT</div>
+      <button id="soundBtn" onclick="cmd('/sound/toggle')">GELUID</button>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>AFSTANDSSENSOREN</h2>
+    <div class="sensor-grid">
+      <div class="sensor">
+        <div class="name">RECHTS</div>
+        <div id="r" class="dist">---</div>
+        <div id="rs" class="state">---</div>
+      </div>
+      <div class="sensor">
+        <div class="name">MIDDEN</div>
+        <div id="c" class="dist">---</div>
+        <div id="cs" class="state">---</div>
+      </div>
+      <div class="sensor">
+        <div class="name">LINKS</div>
+        <div id="l" class="dist">---</div>
+        <div id="ls" class="state">---</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div class="card">
+      <h2>VOLUME</h2>
+      <div class="volume">
+        <button class="volume-btn" onclick="cmd('/volume/down')" aria-label="Volume lager"><span class="volume-symbol volume-minus"></span></button>
+        <div id="v" class="volume-value">--</div>
+        <button class="volume-btn" onclick="cmd('/volume/up')" aria-label="Volume hoger"><span class="volume-symbol volume-plus"></span></button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>VERBINDING</h2>
+      <div id="connection" class="down">OFFLINE</div>
+      <div id="notice">Status wordt geladen...</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>SYSTEEM</h2>
+    <div class="info">
+      <div class="info-row"><span class="label">IP</span><span id="ip">---</span></div>
+      <div class="info-row"><span class="label">WiFi RSSI</span><span id="rssi">---</span></div>
+      <div class="info-row"><span class="label">Kanaal</span><span id="channel">---</span></div>
+      <div class="info-row"><span class="label">DFPlayer</span><span id="dfplayer">---</span></div>
+      <div class="info-row"><span class="label">Uptime</span><span id="uptime">---</span></div>
+    </div>
+  </div>
+
+  <div class="footer">Automatische update elke 2 seconden</div>
+</div>
+
+<script>
 const token='%%API_TOKEN%%';
-async function cmd(u){try{await fetch(u,{headers:{'X-Token':token}});poll()}catch(e){document.getElementById('status').textContent='OFFLINE'}}
-async function poll(){try{let r=await fetch('/status');let d=await r.json();
-for(let x of [['r',d.right],['c',d.center],['l',d.left]])document.getElementById(x[0]).textContent=x[1]>=300?'---':x[1];
-document.getElementById('v').textContent=d.volume;document.getElementById('status').textContent='LIVE | '+d.version+' | '+(d.motors?'RIJDEND':'GESTOPT');
-}catch(e){document.getElementById('status').textContent='OFFLINE'}}poll();setInterval(poll,3000);
-</script></body></html>)rawliteral";
-    String page = FPSTR(html);
+const MIN_CM=30;
+const MID_CM=50;
+const MAX_CM=300;
+
+function setState(id, on, onText, offText){
+  const el=document.getElementById(id);
+  el.textContent=on?onText:offText;
+  el.className='state '+(on?'on':'off');
+}
+
+function setButton(id, on){
+  const el=document.getElementById(id);
+  el.className=on?'active':'inactive';
+  el.textContent=on?'AAN':'UIT';
+}
+
+function sensor(id, stateId, value){
+  const el=document.getElementById(id);
+  const st=document.getElementById(stateId);
+  if(value>=MAX_CM){
+    el.textContent='---';
+    el.className='dist clear';
+    st.textContent='VRIJ';
+    st.className='state clear';
+  }else{
+    el.textContent=value+' cm';
+    if(value<=MIN_CM){
+      el.className='dist blocked';
+      st.textContent='GEBLOKKEERD';
+      st.className='state blocked';
+    }else if(value<=MID_CM){
+      el.className='dist warn';
+      st.textContent='DICHTBIJ';
+      st.className='state warn';
+    }else{
+      el.className='dist clear';
+      st.textContent='VRIJ';
+      st.className='state clear';
+    }
+  }
+}
+
+async function cmd(u){
+  try{
+    const r=await fetch(u,{headers:{'X-Token':token},cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    document.getElementById('notice').textContent='Commando uitgevoerd';
+    await poll();
+  }catch(e){
+    document.getElementById('notice').textContent='Commando mislukt: '+e.message;
+  }
+}
+
+async function poll(){
+  try{
+    const r=await fetch('/status',{cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const d=await r.json();
+
+    setState('displayState',d.display,'AAN','UIT');
+    setState('motorState',d.motors,'RIJDEND','GESTOPT');
+    setState('soundState',d.sound,'AAN','UIT');
+    setButton('displayBtn',d.display);
+    setButton('motorBtn',d.motors);
+    setButton('soundBtn',d.sound);
+
+    sensor('r','rs',Number(d.right));
+    sensor('c','cs',Number(d.center));
+    sensor('l','ls',Number(d.left));
+
+    document.getElementById('v').textContent=d.volume;
+    document.getElementById('version').textContent=d.version;
+    document.getElementById('ip').textContent=d.ip||'---';
+    document.getElementById('rssi').textContent=d.wifi?d.rssi+' dBm':'---';
+    document.getElementById('channel').textContent=d.wifi?d.channel:'---';
+    document.getElementById('dfplayer').textContent=d.dfplayer?'OK':'NIET GEVONDEN';
+    document.getElementById('uptime').textContent=Math.floor(d.uptime/60)+' min '+(d.uptime%60)+' s';
+
+    const conn=document.getElementById('connection');
+    conn.textContent=d.wifi?'ONLINE':'OFFLINE';
+    conn.className=d.wifi?'ok':'down';
+    document.getElementById('notice').textContent='LIVE';
+  }catch(e){
+    document.getElementById('connection').textContent='OFFLINE';
+    document.getElementById('connection').className='down';
+    document.getElementById('notice').textContent='Geen verbinding met de Dalek';
+  }
+}
+
+poll();
+setInterval(poll,2000);
+</script>
+</body>
+</html>)rawliteral";
+
+
+void handleRoot() {
+    String page = FPSTR(WEB_HTML);
     page.replace("%%API_TOKEN%%", API_TOKEN);
     server.send(200,"text/html",page);
 }
@@ -733,6 +987,8 @@ void setup() {
     if(dfOK){mp3.volume(DEFAULT_VOLUME);DBGLN("DFPlayer      : OK");}
     else DBGLN("DFPlayer      : NIET GEVONDEN — geluid uitgeschakeld");
 
+    // Ultrasonic pin mapping: GPIO32 trigger, GPIO34 right PWM,
+    // GPIO35 center PWM, GPIO33 left PWM.
     pinMode(PIN_SONIC_TRIGGER,OUTPUT);
     pinMode(PIN_SONIC_RIGHT,INPUT);
     pinMode(PIN_SONIC_CENTER,INPUT);
