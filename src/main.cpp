@@ -1,5 +1,5 @@
 // =============================================================
-//  main.cpp  -  Dalek ESP32 unified firmware - V0.51
+//  main.cpp  -  Dalek ESP32 unified firmware - V0.52
 //
 //  Consolidates four separate Arduinos into one ESP32:
 //    - dalek_WiFi.ino   (ESP-01)    -> WiFiServer + web UI
@@ -38,7 +38,12 @@
 #include "esp_system.h"
 #include "config.h"
 
-static constexpr const char* FIRMWARE_VERSION = "V0.51";
+static constexpr const char* FIRMWARE_VERSION = "V0.52";
+
+// V0.52 WiFi/OTA state
+static bool otaStarted = false;
+static unsigned long lastWifiAttempt = 0;
+static wl_status_t lastWifiStatus = WL_IDLE_STATUS;
 
 // =============================================================
 //  SHARED STATE
@@ -242,7 +247,7 @@ void sensorAction() {
     }
 }
 
-void applyMotorCmd() {
+void applyMotorCmd(bool force = false) {
     static int prevAppliedCmd = -1;
     int cmd;
     portENTER_CRITICAL(&cmdMux);
@@ -327,6 +332,9 @@ void motorTask(void* pvParameters) {
             // Ensure stopped when movement is disabled
             if (leftStepper  && leftStepper->isRunning())  leftStepper->stopMove();
             if (rightStepper && rightStepper->isRunning()) rightStepper->stopMove();
+            // Force the stop command into the driver after movement was disabled.
+            setMotorCmd(2);
+            applyMotorCmd(true);
         }
 
         esp_task_wdt_reset();
@@ -533,7 +541,9 @@ void processDomeCmd(int& prevCmd, int& boredCount,
         case 11:  // stay away
             if (displayMode) {
                 DBGLN("Stay Away!!");
-                mp3.volume(volume);
+                bool available;
+                portENTER_CRITICAL(&cmdMux); available = dfplayerAvailable; portEXIT_CRITICAL(&cmdMux);
+                if (available) mp3.volume(volume);
                 startFadeEvent(CRGB::White);
                 playSound(SND_STAY_AWAY);
                 lastBored = millis();
@@ -544,7 +554,9 @@ void processDomeCmd(int& prevCmd, int& boredCount,
 
         case 12:  // exterminate
             DBGLN("Exterminate!!");
-            mp3.volume(30);
+            bool available;
+            portENTER_CRITICAL(&cmdMux); available = dfplayerAvailable; portEXIT_CRITICAL(&cmdMux);
+            if (available) mp3.volume(30);
             startFadeEvent(CRGB::Red);
             playSound(SND_EXTERMINATE);
             lastBored = millis();
@@ -572,6 +584,11 @@ void processDomeCmd(int& prevCmd, int& boredCount,
 
         case 19:
             displayMode = false;
+            domeState = DOME_IDLE;
+            fadeBrightness = 0;
+            FastLED.clear();
+            FastLED.setBrightness(0);
+            FastLED.show();
             DBGLN("Display mode OFF");
             prevCmd = cmd;
             break;
@@ -623,11 +640,13 @@ void handleStatus() {
     dm=displayMode; mr=motorRunning; se=soundEnabled; vol=volume;
     r=rightCM; c=centerCM; l=leftCM; df=dfplayerAvailable;
     portEXIT_CRITICAL(&cmdMux);
-    char json[384];
+    char json[512];
+    bool wifi = (WiFi.status() == WL_CONNECTED);
+    String ip = wifi ? WiFi.localIP().toString() : String();
     snprintf(json,sizeof(json),
-        "{\"version\":\"%s\",\"display\":%s,\"motors\":%s,\"sound\":%s,\"dfplayer\":%s,\"volume\":%d,\"right\":%ld,\"center\":%ld,\"left\":%ld,\"rssi\":%d,\"uptime\":%lu}",
+        "{\"version\":\"%s\",\"display\":%s,\"motors\":%s,\"sound\":%s,\"dfplayer\":%s,\"volume\":%d,\"right\":%ld,\"center\":%ld,\"left\":%ld,\"wifi\":%s,\"ip\":\"%s\",\"rssi\":%d,\"channel\":%d,\"uptime\":%lu}",
         FIRMWARE_VERSION,dm?"true":"false",mr?"true":"false",se?"true":"false",df?"true":"false",
-        vol,r,c,l,(int)WiFi.RSSI(),millis()/1000UL);
+        vol,r,c,l,wifi?"true":"false",ip.c_str(),wifi?(int)WiFi.RSSI():0,wifi?(int)WiFi.channel():0,millis()/1000UL);
     server.send(200,"application/json",json);
 }
 
@@ -740,8 +759,11 @@ void setup() {
         DBG("Kanaal        : "); DBGLN(WiFi.channel());
         DBG("MAC-adres     : "); DBGLN(WiFi.macAddress());
         setupOTA();
+        otaStarted = true;
+        lastWifiStatus = WL_CONNECTED;
     }else{
         DBGLN("WiFi-status   : FOUT — offline modus");
+        lastWifiStatus = WiFi.status();
     }
     DBGLN("----------------------------------------");
 
@@ -768,15 +790,36 @@ void loop() {
     static unsigned long lastPulse=millis();
     static unsigned long lastHB=millis();
 
+    // WiFi state machine: reconnect attempts never block the main loop.
+    wl_status_t wifiStatus = WiFi.status();
+    if (wifiStatus != lastWifiStatus) {
+        lastWifiStatus = wifiStatus;
+        DBG("[WiFi] status = "); DBGLN((int)wifiStatus);
+        if (wifiStatus == WL_CONNECTED) {
+            DBGLN("[WiFi] VERBONDEN");
+            DBG("[WiFi] SSID    : "); DBGLN(WiFi.SSID());
+            DBG("[WiFi] IP      : "); DBGLN(WiFi.localIP());
+            DBG("[WiFi] Gateway : "); DBGLN(WiFi.gatewayIP());
+            DBG("[WiFi] RSSI    : "); DBG(WiFi.RSSI()); DBGLN(" dBm");
+            DBG("[WiFi] Channel : "); DBGLN(WiFi.channel());
+            DBG("[WiFi] MAC     : "); DBGLN(WiFi.macAddress());
+            if (!otaStarted) {
+                setupOTA();
+                otaStarted = true;
+            }
+        }
+    }
+
+    if (wifiStatus != WL_CONNECTED && millis() - lastWifiAttempt >= 10000UL) {
+        lastWifiAttempt = millis();
+        DBGLN("[WiFi] reconnect poging...");
+        WiFi.reconnect();
+    }
+
     if(millis()-lastHB>=30000UL){
         lastHB=millis();
         DBG("[HB] uptime=");DBG(millis()/1000);DBG("s heap=");DBG(ESP.getFreeHeap());
-        DBGLN(WiFi.status()==WL_CONNECTED?" wifi=OK":" wifi=DOWN");
-        if(WiFi.status()!=WL_CONNECTED){
-            DBGLN("[HB] WiFi verloren — opnieuw verbinden...");
-            WiFi.disconnect(false);
-            WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
-        }
+        DBGLN(wifiStatus==WL_CONNECTED?" wifi=OK":" wifi=DOWN");
     }
 
     processDomeCmd(prevDomeCmd,boredCount,lastBored,lastPulse);
