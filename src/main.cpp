@@ -137,27 +137,66 @@ void readSensors() {
     leftCM   = (lp > 0) ? lp / 29 / 2 : SONIC_MAX_CM;
 }
 
+// Sticky blocked/clear state with hysteresis: a side becomes "blocked" at
+// SONIC_MIN_CM but doesn't clear again until it's SONIC_HYSTERESIS_CM
+// further out, so a reading sitting right on the threshold doesn't flip
+// the movement decision every cycle.
+static inline void updateBlocked(bool &blocked, long distanceCM) {
+    if (!blocked && distanceCM <= SONIC_MIN_CM) {
+        blocked = true;
+    } else if (blocked && distanceCM > SONIC_MIN_CM + SONIC_HYSTERESIS_CM) {
+        blocked = false;
+    }
+}
+
 void sensorAction() {
     long r = rightCM, c = centerCM, l = leftCM;
     static bool midTriggered = false;
     static bool minTriggered = false;
+    static bool rBlocked = false, cBlocked = false, lBlocked = false;
+    static int  reverseStreak = 0;
+
+    updateBlocked(rBlocked, r);
+    updateBlocked(cBlocked, c);
+    updateBlocked(lBlocked, l);
 
     if (!motorRunning) return;
 
     // Movement decisions
-    if (r > SONIC_MIN_CM && c > SONIC_MIN_CM && l > SONIC_MIN_CM) {
+    if (!rBlocked && !cBlocked && !lBlocked) {
         setMotorCmd(1);   // all clear - forward
         setDomeCmd(10);   // normal
         midTriggered = false;
         minTriggered = false;
-    } else if (r <= SONIC_MIN_CM && c <= SONIC_MIN_CM && l <= SONIC_MIN_CM) {
+        reverseStreak = 0;
+    } else if (rBlocked && cBlocked && lBlocked) {
         setMotorCmd(2);   // fully blocked - stop
-    } else if (r <= SONIC_MIN_CM && c > SONIC_MIN_CM && l > SONIC_MIN_CM) {
+        reverseStreak = 0;
+    } else if (rBlocked && !cBlocked && !lBlocked) {
         setMotorCmd(3);   // blocked right - turn left
-    } else if (r > SONIC_MIN_CM && c > SONIC_MIN_CM && l <= SONIC_MIN_CM) {
+        reverseStreak = 0;
+    } else if (!rBlocked && !cBlocked && lBlocked) {
         setMotorCmd(4);   // blocked left - turn right
-    } else if (c <= SONIC_MIN_CM && r > SONIC_MIN_CM && l > SONIC_MIN_CM) {
-        setMotorCmd(5);   // blocked front - reverse
+        reverseStreak = 0;
+    } else if (rBlocked && cBlocked && !lBlocked) {
+        setMotorCmd(3);   // blocked right+center, left clear - turn left
+        reverseStreak = 0;
+    } else if (!rBlocked && cBlocked && lBlocked) {
+        setMotorCmd(4);   // blocked left+center, right clear - turn right
+        reverseStreak = 0;
+    } else {
+        // Remaining combos: center-only blocked, or right+left blocked
+        // with center clear - both need to back away. After a few reverse
+        // cycles in a row (backed into something new, or oscillating
+        // between two close obstacles) force a turn toward whichever side
+        // currently reads more open instead of reversing indefinitely.
+        if (reverseStreak >= MOTOR_REVERSE_ESCAPE_LIMIT) {
+            setMotorCmd(r >= l ? 4 : 3);
+            reverseStreak = 0;
+        } else {
+            setMotorCmd(5);   // blocked front - reverse
+            reverseStreak++;
+        }
     }
 
     // Alert decisions (fire once per approach event)
@@ -165,7 +204,7 @@ void sensorAction() {
         setDomeCmd(11);
         midTriggered = true;
     }
-    if ((r <= SONIC_MIN_CM || c <= SONIC_MIN_CM || l <= SONIC_MIN_CM) && !minTriggered) {
+    if ((rBlocked || cBlocked || lBlocked) && !minTriggered) {
         setDomeCmd(12);
         minTriggered = true;
     }
@@ -178,7 +217,18 @@ void applyMotorCmd() {
     cmd = motorCmd;
     portEXIT_CRITICAL(&cmdMux);
 
-    if (cmd == prevAppliedCmd) return;  // nothing changed
+    // Reverse (5) is a discrete step move, not a continuous run() like the
+    // other commands. If the obstacle is still there, motorCmd stays 5
+    // across sensor cycles - re-issue the move once the current one
+    // finishes instead of only backing up once per obstacle event.
+    if (cmd == 5 && cmd == prevAppliedCmd) {
+        bool stillMoving = (leftStepper  && leftStepper->isRunning()) ||
+                            (rightStepper && rightStepper->isRunning());
+        if (stillMoving) return;
+        // else fall through and re-issue the reverse move below
+    } else if (cmd == prevAppliedCmd) {
+        return;  // nothing changed
+    }
     prevAppliedCmd = cmd;
 
     switch (cmd) {
@@ -569,11 +619,9 @@ void setupWebRoutes() {
         server.sendHeader("Location", "/"); server.send(303);
     });
     server.on("/movement/on", [](){
-        if (sDisplayMode == "uit") {
-            sMovementState = "aan";
-            motorRunning = true;
-            setDomeCmd(19);
-        }
+        sMovementState = "aan";
+        motorRunning = true;
+        setDomeCmd(19);   // stop idle eyestalk animation while driving
         server.sendHeader("Location", "/"); server.send(303);
     });
     server.on("/movement/off", [](){

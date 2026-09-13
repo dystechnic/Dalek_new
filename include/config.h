@@ -58,6 +58,17 @@
 #define SONIC_MID_CM   50    // outer limit  -> Stay Away
 #define SONIC_MAX_CM  300    // treat readings beyond this as clear
 
+// Hysteresis margin (centimetres). A side is considered "blocked" once it
+// crosses SONIC_MIN_CM, but doesn't clear again until it's this much
+// further out - prevents the movement decision flickering when a reading
+// sits right on the threshold.
+#define SONIC_HYSTERESIS_CM   8
+
+// After this many consecutive reverse cycles (still boxed in after backing
+// up repeatedly), force a turn toward the more open side instead of
+// reversing indefinitely.
+#define MOTOR_REVERSE_ESCAPE_LIMIT  3
+
 // Timeout for pulseIn per sensor (microseconds).
 // 300 cm round-trip at 343 m/s ~ 17500 us. Add margin.
 #define SONIC_PULSE_TIMEOUT_US  20000UL
